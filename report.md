@@ -465,14 +465,304 @@ class JaxPrinter(NumPyPrinter):
 - 函数/常量映射通过字符串前缀替换实现（`numpy.` → `cupy.` 或 `jax.numpy.`）
 - 对于 API 差异（如 JAX 缺少 `reduce` 方法），单独覆盖打印方法
 
-### 2.4 映射覆盖机制总结
+### 2.4 自定义符号映射的合并机制与优先级
+
+用户可以通过 `modules` 参数传入自定义符号映射字典，例如：
+
+```python
+def custom_sin(x):
+    return x * 2  # 自定义实现
+
+f = lambdify(x, sin(x), [{'sin': custom_sin}, 'numpy'])
+```
+
+#### 2.4.1 命名空间合并逻辑
+
+核心合并逻辑位于 `lambdify.py:839-856`：
+
+```python
+# Get the needed namespaces.
+namespaces = []
+# First find any function implementations
+if use_imps:
+    namespaces.append(_imp_namespace(expr))
+# Check for dict before iterating
+if isinstance(modules, (dict, str)) or not hasattr(modules, '__iter__'):
+    namespaces.append(modules)
+else:
+    # consistency check
+    if _module_present('numexpr', modules) and len(modules) > 1:
+        raise TypeError("numexpr must be the only item in 'modules'")
+    namespaces += list(modules)
+# fill namespace with first having highest priority
+namespace = {}
+for m in namespaces[::-1]:
+    buf = _get_namespace(m)
+    namespace.update(buf)
+```
+
+**关键设计：逆序遍历 + `dict.update()`**
+
+合并算法采用**逆序遍历**配合 Python 字典的 `update()` 方法实现优先级控制：
+
+```
+namespaces = [A, B, C]  # 列表顺序
+           ↓
+逆序遍历: [C, B, A]
+           ↓
+执行顺序:
+1. namespace.update(C)  → namespace = C
+2. namespace.update(B)  → namespace = {**C, **B}  (B 覆盖 C)
+3. namespace.update(A)  → namespace = {**C, **B, **A}  (A 覆盖 B)
+```
+
+**结果：列表中**前面**的项优先级**更高**。
+
+#### 2.4.2 完整优先级链
+
+对于调用 `lambdify(x, sin(x), [{'sin': custom_sin}, 'numpy'])`：
+
+1. **namespaces 列表构建**：
+   - 首先添加 `_imp_namespace(expr)`（函数自带的 `_imp_` 属性实现）
+   - 然后添加用户传入的 `modules` 列表
+   - 最终：`namespaces = [_imp_namespace, {'sin': custom_sin}, 'numpy']`
+
+2. **逆序合并**：
+   ```python
+   for m in namespaces[::-1]:  # ['numpy', {'sin': custom_sin}, _imp_namespace]
+       namespace.update(_get_namespace(m))
+   ```
+
+3. **执行步骤**：
+   - 步骤 1：`namespace.update(NUMPY)` → `namespace['sin'] = numpy.sin`
+   - 步骤 2：`namespace.update({'sin': custom_sin})` → `namespace['sin'] = custom_sin`（覆盖）
+   - 步骤 3：`namespace.update(_imp_namespace)` → 如果有同名，会覆盖 custom_sin
+
+**最终优先级（从高到低）**：
+
+| 优先级 | 来源 | 说明 |
+|-------|------|------|
+| 1（最高） | `_imp_namespace` | 函数自带的 `_imp_` 属性数值实现 |
+| 2 | 用户自定义字典 | `modules` 列表中**前面**的字典 |
+| 3 | 内置后端 | `modules` 列表中**后面**的后端名称 |
+| 4（最低） | 默认值 | 表达式中未覆盖的符号 |
+
+#### 2.4.3 打印机层的同步更新
+
+自定义映射不仅影响命名空间层，还会影响打印机层：
+
+```python
+# lambdify.py:890-897
+user_functions = {}
+for m in namespaces[::-1]:
+    if isinstance(m, dict):
+        for k in m:
+            user_functions[k] = k  # 例如 {'sin': 'sin'}
+
+printer = Printer({
+    'fully_qualified_modules': False, 
+    'inline': True,
+    'allow_unknown_functions': True,
+    'user_functions': user_functions
+})
+```
+
+在打印机初始化中：
+
+```python
+# pycode.py:116-120
+self.known_functions = dict(self._kf, **(settings or {}).get(
+    'user_functions', {}))
+```
+
+**影响**：
+- 打印机的 `known_functions` 合并了 `_kf` 和 `user_functions`
+- `user_functions` 中的键值对会**覆盖** `_kf` 中的同名映射
+- 例如 `_kf['sin'] = 'numpy.sin'` 被覆盖为 `known_functions['sin'] = 'sin'`
+
+---
+
+### 2.5 命名空间层与打印机层的协作与冲突处理
+
+双层架构中，命名空间层和打印机层各自承担不同职责，但可能为同一符号定义转换规则。需要明确两者的协作关系和优先级。
+
+#### 2.5.1 两层的职责划分
+
+| 层级 | 职责 | 决定内容 | 关键数据结构 |
+|------|------|---------|-------------|
+| **打印机层** | 代码生成 | 生成的代码中使用什么**名称字符串** | `_kf`/`_kc`、`known_functions` |
+| **命名空间层** | 运行时绑定 | 这些名称在运行时**绑定到什么对象** | `MODULES`、翻译表、自定义字典 |
+
+#### 2.5.2 完整执行流程示例
+
+以表达式 `sin(x)` 使用 `modules='numpy'` 为例：
+
+**阶段 1：打印机层生成代码字符串**
+
+```python
+# NumPyPrinter 的 _kf
+_kf = {..., 'sin': 'numpy.sin', ...}
+
+# _print_known_func 方法
+def _print_known_func(self, expr):
+    known = self.known_functions['sin']  # 'numpy.sin'
+    name = self._module_format(known)    # 'sin'（因为 fully_qualified_modules=False）
+    return f'{name}({args})'             # 'sin(x)'
+```
+
+**关键：`_module_format` 方法**
+
+```python
+# pycode.py:125-133
+def _module_format(self, fqn, register=True):
+    if self._settings['fully_qualified_modules']:
+        return fqn  # 全限定名：'numpy.sin'
+    else:
+        return fqn.split('.')[-1]  # 短名称：'sin'
+```
+
+在 `lambdify` 中，打印机设置为 `'fully_qualified_modules': False`，因此生成**短名称**。
+
+**阶段 2：命名空间层提供运行时绑定**
+
+```python
+# _import('numpy') 执行：
+# 1. exec("import numpy; from numpy import *; from numpy.linalg import *", {}, namespace)
+#    → namespace['sin'] = numpy.sin
+
+# 2. 应用翻译表（NUMPY_TRANSLATIONS）
+#    → 例如 namespace['Heaviside'] = namespace['heaviside']
+```
+
+**阶段 3：执行生成的代码**
+
+```python
+# 生成的代码
+code = '''
+def _lambdifygenerated(x):
+    return sin(x)
+'''
+
+# 编译执行
+c = compile(code, '<lambdifygenerated-1>', 'exec')
+exec(c, namespace, funclocals)
+
+# 调用时
+f = funclocals['_lambdifygenerated']
+result = f(0.5)  # sin(x) 查找 namespace['sin'] → numpy.sin
+```
+
+#### 2.5.3 冲突场景分析
+
+**场景 1：用户传入自定义映射 `{'sin': custom_sin}`**
+
+```python
+f = lambdify(x, sin(x), [{'sin': custom_sin}, 'numpy'])
+```
+
+**打印机层**：
+```python
+# user_functions = {'sin': 'sin'}
+# known_functions = {**_kf, **{'sin': 'sin'}}
+# 结果：known_functions['sin'] = 'sin'（覆盖了 'numpy.sin'）
+
+# 生成的代码：'sin(x)'
+```
+
+**命名空间层**：
+```python
+# 合并后：namespace['sin'] = custom_sin（覆盖了 numpy.sin）
+```
+
+**执行结果**：
+- 生成的代码：`sin(x)`
+- 运行时绑定：`sin` → `custom_sin`
+- 实际调用：`custom_sin(x)`
+
+**场景 2：翻译表与 `_kf` 同时定义同一符号**
+
+以 `ceiling` 函数为例：
+
+```python
+# 翻译表（命名空间层）
+MATH_TRANSLATIONS = {
+    "ceiling": "ceil",  # SymPy: ceiling → Python math: ceil
+}
+
+# _kf（打印机层）
+_kf = {
+    'ceiling': 'math.ceil',  # 代码字符串映射
+}
+```
+
+**执行流程**：
+1. **打印机层**：
+   - `known_functions['ceiling'] = 'math.ceil'`
+   - `_module_format('math.ceil')` → `'ceil'`（短名称）
+   - 生成代码：`ceil(x)`
+
+2. **命名空间层**：
+   - `from math import *` → `namespace['ceil'] = math.ceil`
+   - 翻译表应用：`namespace['ceiling'] = namespace['ceil']` → `namespace['ceiling'] = math.ceil`
+
+3. **执行结果**：
+   - 生成的代码：`ceil(x)`
+   - 运行时查找：`namespace['ceil']` → `math.ceil`
+   - **翻译表在这里没有被使用！**
+
+**关键洞察**：翻译表创建的 `namespace['ceiling']` 别名，在打印机生成 `ceil(x)` 时不会被用到。翻译表的作用是**允许代码中使用 SymPy 风格的名称**，但打印机默认使用后端风格的短名称。
+
+**场景 3：打印机层硬编码特殊方法**
+
+某些打印机方法直接硬编码代码字符串，不受 `_kf` 影响：
+
+```python
+# numpy.py:164-181
+def _print_Piecewise(self, expr):
+    # 直接生成 numpy.select 调用
+    return '{}({}, {}, default={})'.format(
+        self._module_format(self._module + '.select'),  # 'numpy.select' 或 'select'
+        conds, exprs, self._print(S.NaN))
+```
+
+**特点**：
+- 直接使用 `self._module + '.select'`，不查 `_kf`
+- 命名空间层需要提供 `numpy` 模块或 `select` 函数
+- 自定义映射 `{'select': custom_select}` 可能影响运行时绑定
+
+#### 2.5.4 优先级总结
+
+| 符号类型 | 决定因素 | 生效层级 |
+|---------|---------|---------|
+| **函数调用**（如 `sin(x)`） | 打印机层 `_kf` 决定代码中的名称，命名空间层决定运行时绑定 | 两层协作 |
+| **用户自定义映射** | 同时影响打印机层 `known_functions` 和命名空间层 `namespace` | 两层都生效，优先级最高 |
+| **硬编码方法**（如 `_print_Piecewise`） | 打印机层直接生成代码字符串 | 主要由打印机层决定 |
+| **翻译表别名**（如 `ceiling` → `ceil`） | 仅在命名空间层创建别名，打印机默认不使用 | 命名空间层 |
+
+**最终结论**：
+
+1. **打印机层**和**命名空间层**是**协作关系**，不是竞争关系
+   - 打印机层决定"代码中写什么名称"
+   - 命名空间层决定"这个名称绑定到什么对象"
+
+2. **用户自定义映射**优先级最高
+   - 同时影响打印机层的 `known_functions` 和命名空间层的 `namespace`
+   - 可以完全覆盖内置映射
+
+3. **翻译表**的作用有限
+   - 仅在命名空间层创建别名
+   - 打印机默认使用后端风格的短名称，不依赖这些别名
+
+---
+
+### 2.6 映射覆盖机制总结
 
 | 覆盖层级 | 实现方式 | 示例 |
 |---------|---------|------|
 | 类属性定义 | 子类定义自己的 `_kf`/`_kc` | `SciPyPrinter._kf = {**NumPyPrinter._kf, **_scipy_known_functions}` |
 | 初始化合并 | `__init__` 中合并父类映射 | `self._kf = {**PythonCodePrinter._kf, **self._kf}` |
 | 方法覆盖 | 子类重写 `_print_<name>` 方法 | `JaxPrinter._print_And` 覆盖 `NumPyPrinter._print_And` |
-| 用户自定义 | `user_functions` 设置参数 | `lambdify(x, sin(x), [{'sin': custom_sin}, 'numpy'])` |
+| 用户自定义 | `user_functions` 设置参数 + 命名空间合并 | `lambdify(x, sin(x), [{'sin': custom_sin}, 'numpy'])` |
 
 ---
 
