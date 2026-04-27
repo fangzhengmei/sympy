@@ -125,10 +125,45 @@ def __new__(cls, *args, evaluate=None, _sympify=True):
 
 ### 2.3 Add.flatten - 加法规范化
 
-`Add.flatten` 实现了加法表达式的深度规范化：
+`Add.flatten` 实现了加法表达式的深度规范化，包含**快速路径**和**完整规范化**两种分支：
+
+#### 2.3.1 快速路径（早返回分支）
+
+当参与合并的项数很少且满足特定条件时，会走一条快速路径，直接返回而不进入后续复杂流程：
 
 ```python
-# sympy/core/add.py:198-404
+# sympy/core/add.py:219-227
+if len(seq) == 2:
+    a, b = seq
+    if b.is_Rational:
+        a, b = b, a  # 确保 Rational 在前
+    if a.is_Rational and b.is_Mul:
+        # 条件：恰好两个参数，且是 Rational + Mul 的组合
+        if a.is_commutative and b.is_commutative:
+            return [a, b], [], None  # 交换性：放入 c_part
+        else:
+            return [], [a, b], None   # 非交换性：放入 nc_part
+```
+
+**快速路径触发条件**：
+
+| 条件 | 说明 |
+|------|------|
+| `len(seq) == 2` | 恰好两个参数 |
+| `a.is_Rational` | 第一个参数是有理数（必要时交换顺序） |
+| `b.is_Mul` | 第二个参数是乘法表达式 |
+
+**快速路径效果**：
+- 跳过后续的 `terms` 字典构建、同类项合并等复杂流程
+- 直接返回 `[Rational, Mul]` 作为结果
+- 例如 `Add(3, Mul(2, x))` 直接返回 `[3, 2*x]`
+
+#### 2.3.2 完整规范化流程
+
+当不满足快速路径条件时，进入完整规范化流程：
+
+```python
+# sympy/core/add.py:229-404
 @classmethod
 def flatten(cls, seq: list[Expr]) -> tuple[list[Expr], list[Expr], None]:
     """
@@ -160,15 +195,30 @@ def flatten(cls, seq: list[Expr]) -> tuple[list[Expr], list[Expr], None]:
         else:
             terms[s] = c
     
-    # 5. 处理合并结果
+    # 5. 处理合并结果（多路径构造）
     newseq = []
     for s, c in terms.items():
+        # 路径1: 系数为 0，跳过
         if c.is_zero:
-            continue  # 移除系数为 0 的项
+            continue
+        
+        # 路径2: 系数为 1，直接添加符号部分
         elif c is S.One:
             newseq.append(s)  # 1*x → x
+        
+        # 路径3: 系数非 1，根据 s 的类型选择不同构造方式
         else:
-            newseq.append(Mul(c, s))  # 3*x → Mul(3, x)
+            if s.is_Mul:
+                # 路径3a: s 是 Mul，使用 _new_rawargs 快速构造
+                # Mul 已保持参数顺序，只需将 c 插入 slot0
+                cs = s._new_rawargs(*((c,) + s.args))
+                newseq.append(cs)
+            elif s.is_Add:
+                # 路径3b: s 是 Add，使用 evaluate=False 保持未规范化
+                newseq.append(Mul(c, s, evaluate=False))
+            else:
+                # 路径3c: 其他情况，调用完整的 Mul 构造（可能触发规范化）
+                newseq.append(Mul(c, s))
     
     # 6. 规范排序
     _addsort(newseq)  # 按 canonical order 排序
@@ -179,6 +229,16 @@ def flatten(cls, seq: list[Expr]) -> tuple[list[Expr], list[Expr], None]:
     
     return newseq, [], None
 ```
+
+**重建结果序列的多路径构造逻辑**：
+
+| 路径 | 条件 | 构造方式 | 代码位置 |
+|------|------|----------|----------|
+| 路径1 | `c.is_zero` | `continue`（跳过） | `add.py:332-333` |
+| 路径2 | `c is S.One` | `newseq.append(s)` | `add.py:335-336` |
+| 路径3a | `s.is_Mul` | `s._new_rawargs(*((c,) + s.args))` | `add.py:339-346` |
+| 路径3b | `s.is_Add` | `Mul(c, s, evaluate=False)` | `add.py:347-349` |
+| 路径3c | 其他情况 | `Mul(c, s)` | `add.py:350-352` |
 
 **关键规范化行为**：
 
@@ -482,6 +542,105 @@ def default_sort_key(item, order=None):
     1    # coefficient
 )
 ```
+
+#### 2.6.5 排序因果链路的完整流程
+
+从 `ordering_of_classes` 到最终参数排列顺序，存在两条完整的因果链路：
+
+**链路 1：`_addsort` 使用 `_args_sortkey`（直接用于 Add.flatten 中的排序）**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ordering_of_classes (类优先级列表)                                        │
+│   └──► _cmp_name(x, y) 比较两个类名                                        │
+│        └──► Basic.compare(other) 完整比较逻辑                               │
+│             └──► _args_sortkey = cmp_to_key(Basic.compare) 转换为排序键    │
+│                  └──► _addsort(args) 调用 args.sort(key=_args_sortkey)    │
+│                       └──► newseq 按 canonical order 排序                 │
+│                            └──► Add 的 args 最终顺序                        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**关键代码连接**：
+
+```python
+# 1. Basic.compare 使用 _cmp_name
+# sympy/core/basic.py:372-428
+def compare(self, other):
+    # ...
+    n1 = self.__class__
+    n2 = other.__class__
+    c = _cmp_name(n1, n2)  # 调用 _cmp_name 比较类名
+    if c:
+        return c
+    # ... 继续比较 _hashable_content
+
+# 2. _args_sortkey = cmp_to_key(Basic.compare)
+# sympy/core/basic.py:2229
+_args_sortkey = cmp_to_key(Basic.compare)  # 将比较函数转换为排序键
+
+# 3. _addsort 使用 _args_sortkey
+# sympy/core/add.py:40-42
+def _addsort(args):
+    # in-place sorting of args
+    args.sort(key=_args_sortkey)  # 使用 _args_sortkey 作为排序键
+
+# 4. Add.flatten 中调用 _addsort
+# sympy/core/add.py:389
+_addsort(newseq)  # 排序参数列表
+```
+
+**链路 2：`sort_key()` 方法（用于 `default_sort_key` 和 `_sorted_args`）**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ordering_of_classes (类优先级列表)                                        │
+│   └──► class_key() 返回类优先级元组 (e.g., (3, 1, 'Add'))                │
+│        └──► Basic.sort_key() 构建完整排序键                                │
+│             └──► _sorted_args 使用 default_sort_key 排序                   │
+│                  └──► default_sort_key 递归调用 item.sort_key()           │
+│                       └──► 用于排序比较、集合/字典键等场景                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**关键代码连接**：
+
+```python
+# 1. class_key() 定义类优先级
+# sympy/core/add.py:407-408
+@classmethod
+def class_key(cls):
+    return 3, 1, cls.__name__  # (优先级, 子类型, 类名)
+
+# 2. Basic.sort_key() 构建排序键
+# sympy/core/basic.py:453-482
+@cacheit
+def sort_key(self, order=None):
+    # ...
+    args = self._sorted_args  # 获取排序后的参数
+    args = len(args), tuple([inner_key(arg) for arg in args])
+    return self.class_key(), args, S.One.sort_key(), S.One
+
+# 3. Add._sorted_args 使用 default_sort_key
+# sympy/core/add.py:1242-1244
+def _sorted_args(self):
+    from .sorting import default_sort_key
+    return tuple(sorted(self.args, key=default_sort_key))
+
+# 4. default_sort_key 调用 sort_key
+# sympy/core/sorting.py:127-128
+if isinstance(item, Basic):
+    return item.sort_key(order=order)
+```
+
+**两条链路的区别**：
+
+| 特性 | 链路 1 (`_addsort`) | 链路 2 (`sort_key`) |
+|------|---------------------|---------------------|
+| 使用场景 | Add.flatten 内部排序 | 通用排序比较、集合/字典键 |
+| 排序键来源 | `cmp_to_key(Basic.compare)` | `class_key()` + `_sorted_args` |
+| 递归方式 | `Basic.compare` 递归比较 `_hashable_content` | `default_sort_key` 递归调用 `sort_key()` |
+| 缓存策略 | 无（直接比较） | `@cacheit` 缓存 `sort_key()` 结果 |
 
 ---
 
