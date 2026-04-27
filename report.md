@@ -1324,6 +1324,331 @@ if isinstance(expr, Expr):
 
 ---
 
+### 3.6 两条平行处理路径：参数路径 vs 表达式体路径
+
+**重要遗漏**：第三节分析的是**函数参数中**的非法标识符处理路径，但存在另一条平行路径：当保留字符号**出现在表达式体中而非函数参数**时，处理机制完全不同。
+
+#### 3.6.1 两条路径的核心差异
+
+| 特性 | 参数路径（已分析） | 表达式体路径（新增） |
+|------|-------------------|---------------------|
+| **触发时机** | `_EvaluatorPrinter._preprocess` 阶段 | 打印机层 `_print_Symbol` 方法 |
+| **处理方式** | 使用 `Dummy` 符号替换 | 添加后缀 `_`（如 `lambda` → `lambda_`） |
+| **一致性** | 参数名和表达式引用同时替换 | 表达式引用被修改，但符号注入使用原始名称 |
+| **结果** | 运行时正常 | 可能导致 `NameError` |
+
+#### 3.6.2 参数路径的完整流程
+
+**场景**：保留字符号作为函数参数
+
+```python
+x = symbols('x')
+lambda_ = symbols('lambda')  # 符号名是 'lambda'
+expr = sin(x) + cos(lambda_)
+
+f = lambdify([x, lambda_], expr, modules='numpy')
+```
+
+**执行流程**：
+
+```
+1. _EvaluatorPrinter._preprocess 被调用
+        ↓
+2. 遍历参数 [x, lambda_]
+        ↓
+3. 检查 x：_is_safe_ident('x') → True → 无需替换
+        ↓
+4. 检查 lambda_：_is_safe_ident('lambda') → False（是关键字）
+        ↓
+5. 创建 Dummy('_Dummy_1') 替换 lambda_
+        ↓
+6. 使用 xreplace 替换表达式中的所有 lambda_ 引用
+   → 表达式从 sin(x) + cos(lambda_) 变为 sin(x) + cos(_Dummy_1)
+        ↓
+7. 生成代码：
+   def _lambdifygenerated(x, _Dummy_1):
+       return sin(x) + cos(_Dummy_1)
+```
+
+**关键特性**：
+- **一致的替换**：参数名和表达式中的引用都被替换为相同的 Dummy 符号名
+- **符号注入无影响**：表达式已经被修改，不再引用原始的 `lambda` 符号
+
+#### 3.6.3 表达式体路径的完整流程
+
+**场景**：保留字符号只出现在表达式体中，不是参数
+
+```python
+x = symbols('x')
+lambda_ = symbols('lambda')  # 符号名是 'lambda'
+expr = sin(x) + cos(lambda_)
+
+# lambda_ 不作为参数，只出现在表达式体中
+f = lambdify(x, expr, modules='numpy')
+```
+
+**执行流程**：
+
+```
+1. _EvaluatorPrinter._preprocess 被调用
+        ↓
+2. 只处理参数 [x]，不处理表达式体中的自由符号 lambda_
+        ↓
+3. 生成代码字符串时，调用打印机打印表达式
+        ↓
+4. 打印 cos(lambda_) 时，调用 _print_Symbol(lambda_)
+        ↓
+5. _print_Symbol 检查：'lambda' in reserved_words → True
+        ↓
+6. 不报错（error_on_reserved=False），添加后缀
+   → 返回 'lambda' + '_' = 'lambda_'
+        ↓
+7. 生成的代码字符串：
+   def _lambdifygenerated(x):
+       return sin(x) + cos(lambda_)
+        ↓
+8. 符号注入阶段：
+   syms = expr.atoms(Symbol) = {x, lambda_}
+   namespace.update({'x': x, 'lambda': lambda_})  # 使用原始名称！
+        ↓
+9. 编译执行，生成函数
+```
+
+**关键问题**：
+
+| 阶段 | 使用的名称 |
+|------|-----------|
+| **代码生成** | `lambda_`（带后缀） |
+| **符号注入** | `lambda`（原始名称） |
+| **命名空间** | `namespace['lambda'] = lambda_symbol` |
+
+**运行时行为**：
+
+```python
+# 调用 f(0.5)
+def _lambdifygenerated(x):
+    return sin(x) + cos(lambda_)  # 代码中使用 lambda_
+
+# 命名空间中只有 'lambda'，没有 'lambda_'
+# → NameError: name 'lambda_' is not defined
+```
+
+#### 3.6.4 打印机层的后缀添加机制
+
+**核心代码**：
+
+```python
+# pycode.py:597-610
+def _print_Symbol(self, expr):
+    name = super()._print_Symbol(expr)
+    
+    if name in self.reserved_words:
+        if self._settings['error_on_reserved']:
+            msg = ('This expression includes the symbol "{}" which is a '
+                   'reserved keyword in this language.')
+            raise ValueError(msg.format(name))
+        return name + self._settings['reserved_word_suffix']  # 添加后缀！
+    elif '{' in name:
+        return name.replace('{', '').replace('}', '')
+    else:
+        return name
+```
+
+**默认设置**（`codeprinter.py:64-73`）：
+
+```python
+_default_settings = {
+    'error_on_reserved': False,      # 默认不报错
+    'reserved_word_suffix': '_',      # 默认后缀是下划线
+    # ...
+}
+```
+
+**Python 关键字列表**（`pycode.py:14-19`）：
+
+```python
+_kw = {
+    'and', 'as', 'assert', 'break', 'class', 'continue', 'def', 'del', 'elif',
+    'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in',
+    'is', 'lambda', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while',
+    'with', 'yield', 'None', 'False', 'nonlocal', 'True'
+}
+```
+
+#### 3.6.5 符号注入的原始名称使用
+
+**核心代码**：
+
+```python
+# lambdify.py:858-863
+if hasattr(expr, "atoms"):
+    # Try if you can extract symbols from the expression.
+    # Move on if expr.atoms in not implemented.
+    syms = expr.atoms(Symbol)  # 从原始表达式提取符号
+    for term in syms:
+        namespace.update({str(term): term})  # 使用 str(term) 作为键
+```
+
+**关键问题**：
+- `expr.atoms(Symbol)` 从**原始表达式**提取符号，而不是从修改后的表达式
+- `str(term)` 返回符号的原始名称（如 `'lambda'`），而不是修改后的名称（如 `'lambda_'`）
+
+#### 3.6.6 不一致问题的完整分析
+
+**场景复现**：
+
+```python
+from sympy import symbols, sin, cos, lambdify
+
+x = symbols('x')
+lambda_ = symbols('lambda')  # 符号名是 'lambda'
+expr = sin(x) + cos(lambda_)
+
+# lambda_ 不作为参数
+f = lambdify(x, expr, modules='numpy')
+
+# 调用时会发生什么？
+try:
+    result = f(0.5)
+except NameError as e:
+    print(f"错误: {e}")  # 输出：name 'lambda_' is not defined
+```
+
+**执行路径对比**：
+
+| 步骤 | 参数路径（lambda_ 作为参数） | 表达式体路径（lambda_ 不作为参数） |
+|------|----------------------------|-----------------------------------|
+| **1. 参数处理** | `_preprocess` 替换为 `_Dummy_1` | `_preprocess` 只处理 `x`，不处理 `lambda_` |
+| **2. 表达式修改** | `xreplace` 将 `lambda_` 替换为 `_Dummy_1` | 表达式保持不变，仍引用 `lambda_` |
+| **3. 代码生成** | 生成 `cos(_Dummy_1)` | 打印机生成 `cos(lambda_)`（带后缀） |
+| **4. 符号注入** | 表达式已修改，不再引用 `lambda_` | 注入 `namespace['lambda'] = lambda_`（原始名称） |
+| **5. 运行时** | 正常执行 | `NameError: name 'lambda_' is not defined` |
+
+**为什么参数路径不会有问题**：
+
+1. 参数路径中，`_preprocess` 不仅修改参数名，还通过 `xreplace` 修改**表达式本身**
+2. 修改后的表达式不再引用原始的 `lambda_` 符号，而是引用 `_Dummy_1`
+3. 符号注入时，`expr.atoms(Symbol)` 从**修改后的表达式**提取符号，包括 `_Dummy_1`
+4. 因此命名空间中有 `_Dummy_1`，运行时可以找到
+
+**为什么表达式体路径会有问题**：
+
+1. 表达式体路径中，`_preprocess` 只处理参数，**不处理表达式体中的自由符号**
+2. 表达式保持不变，仍然引用原始的 `lambda_` 符号
+3. 打印机层在打印时添加后缀，生成 `lambda_`（带 `_`）
+4. 符号注入使用原始名称 `lambda`（不带 `_`）
+5. 命名空间中有 `lambda`，但代码中使用 `lambda_` → 不一致
+
+#### 3.6.7 边界情况分析
+
+**情况 1：保留字同时作为参数和自由符号**
+
+```python
+x = symbols('x')
+lambda_ = symbols('lambda')
+expr = sin(x) + cos(lambda_)
+
+# lambda_ 作为参数
+f = lambdify([x, lambda_], expr, modules='numpy')
+
+# 结果：正常工作，因为 _preprocess 已经替换了所有引用
+```
+
+**情况 2：非保留字的非法标识符（如下标符号）**
+
+```python
+x1 = symbols('x_{1}')  # 符号名是 'x_{1}'
+expr = x1 ** 2
+
+# x1 不作为参数
+f = lambdify([], expr, modules='numpy')
+
+# 打印机层处理：
+# _print_Symbol 检查 '{' in name → True
+# 返回 'x_{1}'.replace('{', '').replace('}', '') = 'x_1'
+
+# 符号注入：
+# str(x1) = 'x_{1}'
+# namespace['x_{1}'] = x1
+
+# 不一致！代码中使用 'x_1'，但命名空间中有 'x_{1}'
+```
+
+**情况 3：设置 `error_on_reserved=True`**
+
+```python
+from sympy import pycode
+from sympy.printing.pycode import PythonCodePrinter
+
+x = symbols('x')
+lambda_ = symbols('lambda')
+expr = sin(x) + cos(lambda_)
+
+# 使用 error_on_reserved=True
+try:
+    printer = PythonCodePrinter({'error_on_reserved': True})
+    code = printer.doprint(expr)
+except ValueError as e:
+    print(f"错误: {e}")  # 输出：This expression includes the symbol "lambda" which is a reserved keyword in this language.
+```
+
+#### 3.6.8 设计意图与可能的修复方案
+
+**设计意图**：
+
+打印机层的后缀添加机制最初是为了**代码打印**（如 `pycode()` 函数）设计的，用于生成合法的 Python 代码字符串。在独立的代码打印场景中，这个机制是合理的。
+
+但在 `lambdify` 中，这个机制与符号注入步骤**没有协调**，导致了不一致问题。
+
+**可能的修复方案**：
+
+| 方案 | 说明 | 优点 | 缺点 |
+|------|------|------|------|
+| **方案 A**：在 `_preprocess` 阶段处理所有自由符号 | 不仅处理参数，还处理表达式体中的所有自由符号 | 一致性好，与参数路径统一 | 可能改变现有行为，需要更多测试 |
+| **方案 B**：符号注入时使用修改后的名称 | 符号注入时不使用 `str(term)`，而是使用打印机处理后的名称 | 最小化修改 | 需要跟踪每个符号的修改后名称 |
+| **方案 C**：在 `lambdify` 中强制 `error_on_reserved=True` | 当表达式体中存在保留字符号时报错 | 行为明确，用户知道问题所在 | 可能破坏现有代码 |
+| **方案 D**：在 `_preprocess` 后重新检查表达式 | 打印前再次检查表达式，确保一致性 | 灵活性高 | 实现复杂 |
+
+**方案 A 的具体实现思路**：
+
+修改 `_EvaluatorPrinter._preprocess` 方法：
+
+```python
+def _preprocess(self, args, expr, cses=(), _dummies_dict=None):
+    # 现有的参数处理逻辑...
+    
+    # 新增：处理表达式体中的自由符号（不作为参数的符号）
+    from sympy.core.symbol import Symbol, Dummy
+    from sympy import flatten
+    
+    # 获取所有自由符号
+    all_free_symbols = set()
+    if hasattr(expr, 'free_symbols'):
+        all_free_symbols = expr.free_symbols
+    
+    # 获取作为参数的符号
+    arg_symbols = set()
+    for arg in flatten(args):
+        if isinstance(arg, Symbol):
+            arg_symbols.add(arg)
+    
+    # 处理不作为参数的自由符号
+    for sym in all_free_symbols - arg_symbols:
+        s = str(sym)
+        if not self._is_safe_ident(s):
+            # 非法标识符，用 Dummy 替换
+            dummy = Dummy()
+            if isinstance(expr, Expr):
+                dummy = uniquely_named_symbol(
+                    dummy.name, expr, modify=lambda s: '_' + s)
+            _dummies_dict[sym] = dummy
+            expr = expr.xreplace(_dummies_dict)
+    
+    return argstrs, expr
+```
+
+---
+
 ## 四、完整执行流程示例
 
 让我们通过一个完整示例来理解整个机制的协作过程。
