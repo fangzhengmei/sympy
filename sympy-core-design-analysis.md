@@ -353,20 +353,32 @@ for o in seq:
 
 **主循环结构说明**：
 
-| 分支类型 | 条件 | 处理方式 | 代码位置 |
-|----------|------|----------|----------|
-| 独立 if | `o.is_Mul` | 扁平化嵌套，内部有 `continue` | `mul.py:353-369` |
-| elif | `o.is_Number` | 累乘数字系数 | `mul.py:372-381` |
-| elif | `isinstance(o, AccumBounds)` | 处理累积边界 | `mul.py:383-385` |
-| elif | `o is S.ComplexInfinity` | 处理复无穷 | `mul.py:387-392` |
-| elif | `o is S.ImaginaryUnit` | 累计虚数单位指数 | `mul.py:402-404` |
-| elif | `o.is_commutative` | 提取底数和指数 | `mul.py:406-436` |
-| else | 非交换性对象 | 处理非交换乘法 | `mul.py:440-472` |
+| 分支类型 | 条件 | 处理方式 | 控制流 | 代码位置 |
+|----------|------|----------|--------|----------|
+| 独立 if（无 continue） | `o.is_Order` | 提取表达式和 order_symbols | 无 continue，继续后续检查 | `mul.py:349-350` |
+| 独立 if（有 continue） | `o.is_Mul` | 扁平化嵌套 | 有 continue，跳过后续分支 | `mul.py:353-369` |
+| elif | `o.is_Number` | 累乘数字系数 | 有 continue，跳过后续分支 | `mul.py:372-381` |
+| elif | `isinstance(o, AccumBounds)` | 处理累积边界 | 有 continue，跳过后续分支 | `mul.py:383-385` |
+| elif | `o is S.ComplexInfinity` | 处理复无穷 | 有 continue，跳过后续分支 | `mul.py:387-392` |
+| elif | `o is S.ImaginaryUnit` | 累计虚数单位指数 | 有 continue，跳过后续分支 | `mul.py:402-404` |
+| elif | `o.is_commutative` | 提取底数和指数 | 有 continue，跳过后续分支 | `mul.py:406-436` |
+| else | 非交换性对象 | 处理非交换乘法 | 无 continue（循环结束） | `mul.py:440-472` |
 
 **关键设计点**：
-- `if o.is_Mul` 是独立的 `if` 而非 `elif`，因为它内部使用 `continue` 跳过后续分支
-- 其他分支使用 `elif/else` 形成互斥分支
-- 多个分支使用 `continue` 跳过后续处理，或直接 `return` 早返回
+
+1. **`if o.is_Order` 的特殊控制流设计**：
+   - 这是一个**独立的 `if`**，但**没有 `continue` 或 `return`**
+   - 目的是将 `Order` 对象（如 `O(x)`）转换为普通表达式
+   - 转换后的 `o` 会继续进入后续的 `if o.is_Mul` 检查
+   - 这种设计允许 `Order` 被展开后继续参与其他规范化流程
+
+2. **`if o.is_Mul` 是独立的 `if` 而非 `elif`**：
+   - 因为它内部使用 `continue` 跳过后续分支
+   - 如果 `o.is_Order` 转换后 `o` 变成了 `Mul`，它会被这里捕获并扁平化
+
+3. **其他 `elif` 分支形成互斥结构**：
+   - 这些分支使用 `elif/else`，形成互斥选择
+   - 每个分支最后都有 `continue` 或 `return`
 
 主循环之后还有幂次合并、特殊幂次处理、排序等步骤，与报告中的描述一致。
 
