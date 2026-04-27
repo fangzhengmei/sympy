@@ -252,76 +252,123 @@ def flatten(cls, seq: list[Expr]) -> tuple[list[Expr], list[Expr], None]:
 
 ### 2.4 Mul.flatten - 乘法规范化
 
-`Mul.flatten` 的规范化逻辑与 `Add` 类似，但针对乘法特性进行了优化：
+`Mul.flatten` 的规范化逻辑与 `Add` 类似，同样包含**快速路径**和**完整规范化流程**，但针对乘法特性进行了优化：
+
+#### 2.4.1 快速路径（早返回分支）
+
+与 `Add.flatten` 类似，当参数很少时会走快速路径：
 
 ```python
-# sympy/core/mul.py:210-739
-@classmethod
-def flatten(cls, seq):
-    """Return commutative, noncommutative and order arguments by
-    combining related terms."""
-    
-    # 1. 扁平化嵌套 Mul
-    for o in seq:
-        if o.is_Mul:
-            if o.is_commutative:
-                seq.extend(o.args)
-            # ... 非交换部分处理 ...
-    
-    # 2. 分离数字系数
-    elif o.is_Number:
-        coeff *= o
-        continue
-    
-    # 3. 按底部分组合并指数
-    # x * x**2 → x**3
-    c_powers = []  # (base, exp) 列表
-    for o in seq:
-        b, e = o.as_base_exp()
-        c_powers.append((b, e))
-    
-    # 合并同底数
-    def _gather(c_powers):
-        common_b = {}  # base: exp
-        for b, e in c_powers:
-            co = e.as_coeff_Mul()
-            common_b.setdefault(b, {}).setdefault(
-                co[1], []).append(co[0])
-        # ... 合并指数 ...
-        return new_c_powers
-    
-    # 4. 处理特殊幂次
-    # x**0 → 1, x**1 → x
-    for b, e in c_powers:
-        if e.is_zero:
-            continue  # 移除 x**0
-        if e is S.One:
-            if b.is_Number:
-                coeff *= b
-                continue
-            p = b
-        else:
-            p = Pow(b, e)
-        c_part.append(p)
-    
-    # 5. 处理负号和虚数单位
-    # (-2)**(1/2) → I*sqrt(2)
-    neg1e = S.Zero  # -1 的指数累计
-    for o in seq:
-        if o is S.ImaginaryUnit:
-            neg1e += S.Half  # I = (-1)**(1/2)
-            continue
-        # ... 其他处理 ...
-    
-    # 6. 规范排序
-    _mulsort(c_part)
-    
-    # 7. 系数前置
-    if coeff is not S.One:
-        c_part.insert(0, coeff)
-    
-    return c_part, nc_part, order_symbols
+# sympy/core/mul.py:291-312
+if len(seq) == 2:
+    a, b = seq
+    if b.is_Rational:
+        a, b = b, a
+        seq = [a, b]
+    assert a is not S.One
+    if a.is_Rational and not a.is_zero:
+        r, b = b.as_coeff_Mul()
+        if b.is_Add:
+            if r is not S.One:  # 2-arg hack
+                # ...
+            elif global_parameters.distribute and b.is_commutative:
+                # 分配律：2*(x+y) → 2*x + 2*y
+                newb = Add(*[_keep_coeff(a, bi) for bi in b.args])
+                rv = [newb], [], None
+    if rv:
+        return rv  # 早返回
 ```
+
+**快速路径触发条件**：
+- `len(seq) == 2`：恰好两个参数
+- 第一个参数是 `Rational` 且非零
+- 第二个参数提取系数后是 `Add`
+
+#### 2.4.2 完整规范化流程
+
+当不满足快速路径条件时，进入主循环处理所有参数。主循环内部使用多个 `if/elif` 分支处理不同类型的参数：
+
+```python
+# sympy/core/mul.py:347-473
+# 主循环：遍历所有参数
+for o in seq:
+    # 分支 1: Order 类型（大 O 记号）
+    if o.is_Order:
+        o, order_symbols = o.as_expr_variables(order_symbols)
+
+    # 分支 2: Mul 类型（扁平化嵌套）
+    # 注意：这是独立的 if，不是 elif，因为内部有 continue
+    if o.is_Mul:
+        if o.is_commutative:
+            seq.extend(o.args)  # 展开交换性 Mul
+        else:
+            # 处理非交换性 Mul
+            for q in o.args:
+                if q.is_commutative:
+                    seq.append(q)
+                else:
+                    nc_seq.append(q)
+            seq.append(NC_Marker)  # 非交换标记
+        continue  # 跳过后续 elif 分支
+
+    # 分支 3: Number 类型（数字系数）
+    elif o.is_Number:
+        if o is S.NaN or coeff is S.ComplexInfinity and o.is_zero:
+            return [S.NaN], [], None  # NaN 早返回
+        elif coeff.is_Number or isinstance(coeff, AccumBounds):
+            coeff *= o  # 累乘系数
+            if coeff is S.NaN:
+                return [S.NaN], [], None
+        continue
+
+    # 分支 4: AccumBounds 类型（累积边界）
+    elif isinstance(o, AccumBounds):
+        coeff = o.__mul__(coeff)
+        continue
+
+    # 分支 5: 复无穷
+    elif o is S.ComplexInfinity:
+        if not coeff:
+            return [S.NaN], [], None  # 0 * zoo = NaN
+        coeff = S.ComplexInfinity
+        continue
+
+    # 分支 6: 虚数单位 I
+    elif o is S.ImaginaryUnit:
+        neg1e += S.Half  # I = (-1)^(1/2)
+        continue
+
+    # 分支 7: 交换性对象（提取底数和指数）
+    elif o.is_commutative:
+        b, e = o.as_base_exp()
+        # 处理特殊幂次...
+        c_powers.append((b, e))
+        continue
+
+    # 分支 8: 非交换性对象
+    else:
+        # 处理非交换乘法...
+        pass
+```
+
+**主循环结构说明**：
+
+| 分支类型 | 条件 | 处理方式 | 代码位置 |
+|----------|------|----------|----------|
+| 独立 if | `o.is_Mul` | 扁平化嵌套，内部有 `continue` | `mul.py:353-369` |
+| elif | `o.is_Number` | 累乘数字系数 | `mul.py:372-381` |
+| elif | `isinstance(o, AccumBounds)` | 处理累积边界 | `mul.py:383-385` |
+| elif | `o is S.ComplexInfinity` | 处理复无穷 | `mul.py:387-392` |
+| elif | `o is S.ImaginaryUnit` | 累计虚数单位指数 | `mul.py:402-404` |
+| elif | `o.is_commutative` | 提取底数和指数 | `mul.py:406-436` |
+| else | 非交换性对象 | 处理非交换乘法 | `mul.py:440-472` |
+
+**关键设计点**：
+- `if o.is_Mul` 是独立的 `if` 而非 `elif`，因为它内部使用 `continue` 跳过后续分支
+- 其他分支使用 `elif/else` 形成互斥分支
+- 多个分支使用 `continue` 跳过后续处理，或直接 `return` 早返回
+
+主循环之后还有幂次合并、特殊幂次处理、排序等步骤，与报告中的描述一致。
 
 **关键规范化行为**：
 
