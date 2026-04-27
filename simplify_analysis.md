@@ -37,7 +37,7 @@ def simplify(expr, ratio=1.7, measure=count_ops, rational=False,
 | 步骤 | 代码位置 | 策略 | 说明 |
 |------|----------|------|------|
 | 1 | L611 | `sympify(expr, rational=rational)` | 转换为 SymPy 表达式 |
-| 2 | L619-620 | 零表达式检测 | 如果是零且为数字类型，直接返回 |
+| 2 | L619-620 | 零表达式检测 | 任何 is_zero 为真的 Expr 类型；非数字类型返回 S.Zero，数字类型返回原值 |
 | 3 | L622-624 | `_eval_simplify` 自定义方法 | 如果表达式有自定义化简方法，优先使用 |
 | 4 | L626 | `collect_abs(signsimp(expr))` | 符号化简与绝对值收集 |
 
@@ -115,7 +115,7 @@ def simplify(expr, ratio=1.7, measure=count_ops, rational=False,
 
 | 短路点 | 代码位置 | 判定条件 | 行为 |
 |--------|----------|----------|------|
-| 1 | L619-620 | 表达式是零且为 Number 类型 | 直接返回 `S.Zero` 或原表达式 |
+| 1 | L619-620 | 任何 is_zero 为真的 Expr 类型 | 非数字类型返回 `S.Zero`，数字类型返回原表达式 |
 | 2 | L622-624 | 表达式有 `_eval_simplify` 自定义方法 | 调用该方法并直接返回结果 |
 | 3 | L628-629 | 不是 `Basic` 类型或没有参数 | 直接返回表达式 |
 | 4 | L633-634 | `inverse=True` 且化简后无参数 | 直接返回化简结果 |
@@ -164,27 +164,19 @@ if not isinstance(expr, handled):
 
 #### 3.2.3 Piecewise 处理的提前返回
 
-```python
-# L684-708
-if expr.has(Piecewise):
-    # ... 多次折叠和化简 ...
-    if expr.has(Piecewise):
-        # 多次处理后仍然是 Piecewise
-        expr = piecewise_simplify(expr, deep=True, doit=False)
-        if expr.has(Piecewise):
-            expr = shorter(expr, factor_terms(expr))
-            return expr  # 提前返回
-```
+`Piecewise` 表达式的处理采用了 4 层嵌套的"尽力而为"策略：
 
-`Piecewise` 表达式的处理采用了"尽力而为"的策略：
-1. 首先尝试折叠为单个 Piecewise
-2. 应用化简并再次检查
-3. 如果经过多次处理后仍然是 Piecewise，直接返回
+| 嵌套层 | 代码位置 | 检查条件 | 处理步骤 |
+|--------|----------|----------|----------|
+| 第 1 层 | L684 | `if expr.has(Piecewise):` | L686: `piecewise_fold(expr)` 第一次折叠<br>L688: `done(expr)` **求值**（doit 可能消除 Piecewise） |
+| 第 2 层 | L690 | `if expr.has(Piecewise):` | L693: `piecewise_fold(expr)` 再次折叠<br>L695-696: 若有 KroneckerDelta 则调用 `kroneckersimp` |
+| 第 3 层 | L698 | `if expr.has(Piecewise):` | L701: `piecewise_simplify(expr, deep=True, doit=False)` |
+| 第 4 层 | L703 | `if expr.has(Piecewise):` | L705: `shorter(expr, factor_terms(expr))` 选最优<br>L708: `return expr` 提前返回 |
 
 **设计意图**：
-- `Piecewise` 表达式可能在化简后消失（如条件被判定为恒真或恒假）
-- 如果无法消除，继续应用其他策略可能会使表达式更复杂
-- 尽早返回以避免无效计算
+- `done(expr)` 的求值步骤（第 1 层）可以触发积分、求和等操作，有可能直接消除 Piecewise 分支
+- `kroneckersimp`（第 2 层）可简化含 KroneckerDelta 的分段条件，是 Piecewise 化简特有的中间步骤
+- 四层递进后若仍是 Piecewise，继续应用其他策略只会使表达式更复杂，故提前返回
 
 ### 3.3 最终回退机制
 
