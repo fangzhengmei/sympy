@@ -625,15 +625,25 @@ def _hashable_content(self) -> tuple[Hashable, ...]:
 
 #### 3.3.1 子类重写示例：`Symbol`
 
+`Symbol` 的 `_hashable_content` 直接使用已预处理好的字段，无需在调用时重新排序：
+
 ```python
-# sympy/core/symbol.py 中的典型实现
-class Symbol(Basic):
-    # ...
-    
-    def _hashable_content(self):
-        # Symbol 除了 args（通常为空），还需要 name 和 assumptions
-        return (self.name,) + tuple(sorted(self.assumptions0.items()))
+# sympy/core/symbol.py:386-390
+# 在 __xnew__ 中预处理 assumptions0
+assumptions_kb, assumptions_orig, assumptions0 = Symbol._canonical_assumptions(**assumptions)
+# ...
+obj._assumptions0 = tuple(sorted(assumptions0.items()))  # 预处理为已排序的元组
+
+# sympy/core/symbol.py:428-429
+def _hashable_content(self):
+    # 直接使用已预处理好的 _assumptions0，无需再次排序
+    return (self.name,) + self._assumptions0
 ```
+
+**关键点**：
+- `_assumptions0` 在对象创建时就已预处理为 `tuple(sorted(assumptions0.items()))`
+- `_hashable_content` 直接拼接 `self._assumptions0`，无需额外排序操作
+- 这避免了每次调用 `_hashable_content` 时的重复排序开销
 
 #### 3.3.2 哈希与相等性的一致性
 
