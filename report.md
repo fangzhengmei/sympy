@@ -538,7 +538,7 @@ namespaces = [A, B, C]  # 列表顺序
    - 步骤 2：`namespace.update({'sin': custom_sin})` → `namespace['sin'] = custom_sin`（覆盖）
    - 步骤 3：`namespace.update(_imp_namespace)` → 如果有同名，会覆盖 custom_sin
 
-**最终优先级（从高到低）**：
+**合并阶段的优先级（从高到低）**：
 
 | 优先级 | 来源 | 说明 |
 |-------|------|------|
@@ -546,6 +546,285 @@ namespaces = [A, B, C]  # 列表顺序
 | 2 | 用户自定义字典 | `modules` 列表中**前面**的字典 |
 | 3 | 内置后端 | `modules` 列表中**后面**的后端名称 |
 | 4（最低） | 默认值 | 表达式中未覆盖的符号 |
+
+---
+
+#### 2.4.3 符号注入：最终的覆盖机制
+
+**重要遗漏**：在命名空间合并完成后，还有一个**符号注入**步骤，会将表达式中的所有 `Symbol` 类型原子以符号对象形式注入命名空间。
+
+**触发时机**：
+
+```python
+# lambdify.py:858-863
+if hasattr(expr, "atoms"):
+    # Try if you can extract symbols from the expression.
+    # Move on if expr.atoms in not implemented.
+    syms = expr.atoms(Symbol)
+    for term in syms:
+        namespace.update({str(term): term})
+```
+
+**执行顺序**：
+
+```
+1. 构建 namespaces 列表
+        ↓
+2. 逆序合并命名空间（循环执行 namespace.update()）
+        ↓
+3. 符号注入（expr.atoms(Symbol) 提取并注入）← 最后执行！
+```
+
+**符号注入的行为**：
+
+| 特性 | 说明 |
+|------|------|
+| **触发条件** | 表达式具有 `atoms` 方法（通常是 SymPy 表达式） |
+| **提取类型** | 只提取 `Symbol` 类型的原子 |
+| **注入方式** | `{str(term): term}`，即键是符号名，值是符号对象本身 |
+| **执行顺序** | 在合并循环**之后**执行 |
+| **覆盖行为** | 会覆盖之前合并的所有同名值 |
+
+**不被符号注入影响的类型**：
+
+| 类型 | 示例 | 原因 |
+|------|------|------|
+| `NumberSymbol` | `pi`, `E`, `GoldenRatio` | 不是 `Symbol` 类型 |
+| `ImaginaryUnit` | `I` | 不是 `Symbol` 类型 |
+| `Function` | `sin`, `cos`, `exp` | 不是 `Symbol` 类型 |
+| 数字 | `1`, `2.5`, `Rational(1,2)` | 不是 `Symbol` 类型 |
+
+**测试验证**：
+
+```python
+# test_lambdify.py:162-167
+def test_atoms():
+    # Non-Symbol atoms should not be pulled out from the expression namespace
+    f = lambdify(x, pi + x, {"pi": 3.14})
+    assert f(0) == 3.14  # pi 不是 Symbol 类型，自定义映射生效
+    f = lambdify(x, I + x, {"I": 1j})
+    assert f(1) == 1 + 1j  # I 不是 Symbol 类型，自定义映射生效
+```
+
+---
+
+#### 2.4.4 完整优先级链（修正后）
+
+**最终执行顺序**：
+
+```
+1. namespaces 列表构建
+        ↓
+2. 逆序合并（_imp_namespace > 用户自定义 > 内置后端）
+        ↓
+3. 符号注入（只针对 Symbol 类型）← 优先级最高！
+```
+
+**完整优先级表**：
+
+| 优先级 | 来源 | 影响范围 | 说明 |
+|-------|------|---------|------|
+| **1（最高）** | **符号注入** | 只影响 `Symbol` 类型的符号名 | 在合并循环之后执行，覆盖所有同名值 |
+| 2 | `_imp_namespace` | 函数名（如 `'f'`, `'g'`） | 从表达式中提取带 `_imp_` 属性的函数 |
+| 3 | 用户自定义字典 | 符号名、函数名 | `modules` 列表中**前面**的字典 |
+| 4 | 内置后端 | 符号名、函数名 | `modules` 列表中**后面**的后端名称 |
+| 5（最低） | 默认值 | 所有名称 | 表达式中未覆盖的符号 |
+
+**关键区分**：
+
+| 映射类型 | 键的类型 | 是否被符号注入覆盖 |
+|---------|---------|-------------------|
+| `_imp_namespace` | 函数名（如 `'f'`） | **否**（函数不是 `Symbol` 类型） |
+| 用户自定义函数名（如 `{'sin': custom_sin}`） | 函数名 | **否**（`sin` 是 `Function`，不是 `Symbol`） |
+| 用户自定义符号名（如 `{'y': 10}`） | 符号名 | **是**（`y` 是 `Symbol` 类型） |
+
+---
+
+#### 2.4.5 符号注入的实际影响与用途
+
+**设计意图**：
+
+符号注入的设计目的是让表达式中的自由符号（不作为参数的符号）在默认情况下保持**符号态**，而不是意外使用命名空间中的值。
+
+**场景分析**：
+
+**场景 1：符号作为函数参数（最常见）**
+
+```python
+x, y = symbols('x y')
+expr = sin(x) + y
+
+# x 和 y 都作为参数
+f = lambdify([x, y], expr, modules='numpy')
+```
+
+**生成的代码**：
+```python
+def _lambdifygenerated(x, y):
+    return sin(x) + y
+```
+
+**执行时**：
+- `x` 和 `y` 是**局部变量**，从函数参数获取值
+- 命名空间中的 `namespace['x']` 和 `namespace['y']` **不会被使用**
+- 符号注入**无实际影响**
+
+**场景 2：符号不作为函数参数**
+
+```python
+x, y = symbols('x y')
+expr = sin(x) + y
+
+# 只有 x 作为参数，y 是自由符号
+f = lambdify(x, expr, modules='numpy')
+```
+
+**生成的代码**：
+```python
+def _lambdifygenerated(x):
+    return sin(x) + y
+```
+
+**执行流程**：
+
+```
+1. 合并阶段：namespace['y'] = numpy.y（如果存在）或未定义
+        ↓
+2. 符号注入：namespace['y'] = y（符号对象）← 覆盖！
+        ↓
+3. 调用 f(0.5)：
+   - x = 0.5（局部变量）
+   - y 从命名空间查找 → y（符号对象）
+   - 结果：sin(0.5) + y（符号表达式）
+```
+
+**结果**：`y` 保持为符号对象，不会使用命名空间中的值。
+
+**场景 3：用户自定义符号值（冲突场景）**
+
+```python
+x, y = symbols('x y')
+expr = sin(x) + y
+
+# 用户期望 y = 10
+f = lambdify(x, expr, [{'y': 10}, 'numpy'])
+```
+
+**执行流程**：
+
+```
+1. 合并阶段：
+   - namespace.update(NUMPY)
+   - namespace.update({'y': 10}) → namespace['y'] = 10
+        ↓
+2. 符号注入：
+   - syms = expr.atoms(Symbol) = {x, y}
+   - namespace.update({'x': x, 'y': y}) → namespace['y'] = y（符号对象）
+        ↓
+3. 调用 f(0.5)：
+   - y 从命名空间查找 → y（符号对象）
+   - 结果：sin(0.5) + y（符号表达式）
+```
+
+**实际行为**：用户的自定义映射 `{'y': 10}` 被符号注入**覆盖**，`y` 保持为符号对象。
+
+**设计意图的权衡**：
+
+| 设计选择 | 优点 | 缺点 |
+|---------|------|------|
+| 自由符号默认保持符号态 | 防止意外使用命名空间中的值，保持符号计算的一致性 | 用户自定义的符号值会被覆盖，可能造成困惑 |
+| `atoms(Symbol)` 只提取 Symbol 类型 | `pi`, `I`, 函数名等不受影响 | 行为不够统一，需要理解类型差异 |
+
+**如何为自由符号提供默认值**：
+
+如果确实需要为自由符号提供默认值，有两种方式：
+
+1. **将符号包含在参数中**（推荐）：
+   ```python
+   f = lambdify([x, y], expr, modules='numpy')
+   # 调用时传入 y 的值
+   result = f(0.5, 10)
+   ```
+
+2. **使用 `Piecewise` 或条件表达式**：
+   ```python
+   from sympy import Piecewise
+   expr_with_default = Piecewise((sin(x) + 10, True), (sin(x) + y, False))
+   ```
+
+---
+
+#### 2.4.6 与用户自定义映射的冲突分析
+
+**冲突场景总结**：
+
+| 自定义映射类型 | 示例 | 是否被符号注入覆盖 | 实际行为 |
+|---------------|------|-------------------|---------|
+| 函数名映射 | `{'sin': custom_sin}` | **否** | 正常生效，`sin(x)` 调用 `custom_sin(x)` |
+| 非 Symbol 常量 | `{'pi': 3.14}` | **否** | 正常生效（测试用例验证） |
+| Symbol 类型符号名 | `{'y': 10}` | **是** | 被覆盖，`y` 保持为符号对象 |
+
+**代码执行路径分析**：
+
+```python
+# 假设调用：lambdify(x, sin(x) + y, [{'sin': custom_sin, 'y': 10}, 'numpy'])
+
+# 阶段 1：构建 namespaces 列表
+namespaces = [
+    _imp_namespace(expr),      # 从表达式提取 _imp_ 函数
+    {'sin': custom_sin, 'y': 10},  # 用户自定义
+    'numpy'                    # 内置后端
+]
+
+# 阶段 2：逆序合并
+namespace = {}
+for m in namespaces[::-1]:  # ['numpy', {'sin': custom_sin, 'y': 10}, _imp_namespace]
+    namespace.update(_get_namespace(m))
+# 合并后：
+# namespace['sin'] = custom_sin（覆盖了 numpy.sin）
+# namespace['y'] = 10（用户自定义）
+
+# 阶段 3：符号注入 ← 关键！
+if hasattr(expr, "atoms"):
+    syms = expr.atoms(Symbol)  # {x, y} - 只提取 Symbol 类型
+    for term in syms:
+        namespace.update({str(term): term})
+# 注入后：
+# namespace['y'] = y（符号对象）← 覆盖了 10！
+# namespace['sin'] = custom_sin（不受影响，因为 sin 不是 Symbol）
+```
+
+**最终命名空间状态**：
+
+| 键 | 值 | 来源 |
+|---|---|------|
+| `'sin'` | `custom_sin` | 用户自定义（函数名，不受符号注入影响） |
+| `'y'` | `y`（符号对象） | 符号注入（覆盖了用户自定义的 `10`） |
+| `'x'` | `x`（符号对象） | 符号注入 |
+
+**运行时行为**：
+
+```python
+# 生成的代码
+def _lambdifygenerated(x):
+    return sin(x) + y
+
+# 调用 f(0.5)
+# - x = 0.5（局部变量，不受命名空间影响）
+# - sin 从命名空间查找 → custom_sin（正确使用用户自定义）
+# - y 从命名空间查找 → y（符号对象，不是 10！）
+# - 结果：custom_sin(0.5) + y（符号表达式）
+```
+
+**关键洞察**：
+
+符号注入的设计目标是**保护自由符号的符号态**，防止它们意外绑定到命名空间中的值。这意味着：
+
+1. **函数名映射始终有效**：`{'sin': custom_sin}` 不会被覆盖
+2. **非 Symbol 常量映射有效**：`{'pi': 3.14}` 不会被覆盖
+3. **Symbol 类型的符号名映射会被覆盖**：`{'y': 10}` 会被覆盖
+
+这种设计确保了符号计算的一致性，但需要用户理解类型差异。
 
 #### 2.4.3 打印机层的同步更新
 
