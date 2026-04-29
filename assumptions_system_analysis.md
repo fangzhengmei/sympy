@@ -29,45 +29,209 @@ SymPy 采用**双轨假设系统**设计，同时维护两套假设机制：
 4. **前提扩展**：如果当前事实无法确定，根据 `prereq` 表扩展查询相关的前提事实
 5. **结果缓存**：最终结果存入 `_assumptions` 字典
 
-**代码分析：**
+**代码分析（含随机打乱目的和多线程处理）：**
+
+文件位置：`sympy/core/assumptions.py:518-620`
 
 ```python
 def _ask(fact, obj):
-    assumptions = obj._assumptions  # FactKB 实例
-    handler_map = obj._prop_handler  # _eval_is_* 方法映射
+    """
+    Find the truth value for a property of an object.
     
+    ...
+    
+    In all cases, when we settle on some fact value, its implications are
+    deduced, and the result is cached in ._assumptions.
+    """
+    # FactKB which is dict-like and maps facts to their known values:
+    assumptions = obj._assumptions
+
+    # A dict that maps facts to their handlers:
+    handler_map = obj._prop_handler
+
+    # This is our queue of facts to check:
     facts_to_check = [fact]
     facts_queued = {fact}
-    
+
+    # Loop over the queue as it extends
     for fact_i in facts_to_check:
+
+        # If fact_i has already been determined then we don't need to rerun the
+        # handler. There is a potential race condition for multithreaded code
+        # though because it's possible that fact_i was checked in another
+        # thread. The main logic of the loop below would potentially skip
+        # checking assumptions[fact] in this case so we check it once after the
+        # loop to be sure.
         if fact_i in assumptions:
-            continue  # 已有缓存，跳过
-        
-        # 1. 调用处理器方法
+            continue
+
+        # Now we call the associated handler for fact_i if it exists.
         fact_i_value = None
         handler_i = handler_map.get(fact_i)
         if handler_i is not None:
             fact_i_value = handler_i(obj)
-        
-        # 2. 如果获得新值，进行演绎推理
+
+        # If we get a new value for fact_i then we should update our knowledge
+        # of fact_i as well as any related facts that can be inferred using the
+        # inference rules connecting the fact_i and any other fact values that
+        # are already known.
         if fact_i_value is not None:
             assumptions.deduce_all_facts(((fact_i, fact_i_value),))
-        
-        # 3. 检查目标事实是否已被推断出
+
+        # Usually if assumptions[fact] is now not None then that is because of
+        # the call to deduce_all_facts above. The handler for fact_i returned
+        # True or False and knowing fact_i (which is equal to fact in the first
+        # iteration) implies knowing a value for fact. It is also possible
+        # though that independent code e.g. called indirectly by the handler or
+        # called in another thread in a multithreaded context might have
+        # resulted in assumptions[fact] being set. Either way we return it.
         fact_value = assumptions.get(fact)
         if fact_value is not None:
             return fact_value
-        
-        # 4. 扩展查询前提事实
+
+        # Extend the queue with other facts that might determine fact_i. Here
+        # we randomise the order of the facts that are checked. This should not
+        # lead to any non-determinism if all handlers are logically consistent
+        # with the inference rules for the facts. Non-deterministic assumptions
+        # queries can result from bugs in the handlers that are exposed by this
+        # call to shuffle. These are pushed to the back of the queue meaning
+        # that the inference graph is traversed in breadth-first order.
         new_facts_to_check = list(_assume_rules.prereq[fact_i] - facts_queued)
-        shuffle(new_facts_to_check)  # 随机化顺序以检测非确定性
+        shuffle(new_facts_to_check)
         facts_to_check.extend(new_facts_to_check)
         facts_queued.update(new_facts_to_check)
-    
-    # 5. 无法确定，缓存 None
+
+    # The above loop should be able to handle everything fine in a
+    # single-threaded context but in multithreaded code it is possible that
+    # this thread skipped computing a particular fact that was computed in
+    # another thread (due to the continue). In that case it is possible that
+    # fact was inferred and is now stored in the assumptions dict but it wasn't
+    # checked for in the body of the loop. This is an obscure case but to make
+    # sure we catch it we check once here at the end of the loop.
+    if fact in assumptions:
+        return assumptions[fact]
+
+    # This query can not be answered. It's possible that e.g. another thread
+    # has already stored None for fact but assumptions._tell does not mind if
+    # we call _tell twice setting the same value. If this raises
+    # InconsistentAssumptions then it probably means that another thread
+    # attempted to compute this and got a value of True or False rather than
+    # None. In that case there must be a bug in at least one of the handlers.
+    # If the handlers are all deterministic and are consistent with the
+    # inference rules then the same value should be computed for fact in all
+    # threads.
     assumptions._tell(fact, None)
     return None
 ```
+
+**关键修正点：**
+
+### 1. 随机打乱的真实目的
+
+**重要修正：原描述"随机化顺序以检测非确定性"不准确。实际目的是暴露处理器逻辑 bug。**
+
+**官方注释原文：**
+
+> "Here we randomise the order of the facts that are checked. **This should not lead to any non-determinism if all handlers are logically consistent with the inference rules for the facts.** Non-deterministic assumptions queries can result from **bugs in the handlers that are exposed by this call to shuffle.**"
+
+**正确理解（分层逻辑）：**
+
+| 层次 | 逻辑 |
+|------|------|
+| **前提** | 若所有处理器逻辑正确且与推理规则一致 |
+| **推论** | 查询顺序不同也应得到相同结果（确定性） |
+| **症状** | 非确定性本身正是 **bug 的症状** |
+| **手段** | 随机打乱是让 bug 更容易被触发和发现的手段 |
+
+**与原错误理解的对比：**
+
+| 原错误理解 | 正确理解 |
+|-----------|---------|
+| "随机化顺序以检测非确定性" | 随机化顺序以**暴露处理器逻辑 bug** |
+| 认为"检测非确定性"是目的 | 认为"非确定性"是**bug 的症状**，随机打乱是**发现 bug 的手段** |
+
+**设计意图的准确描述：**
+
+1. **正确性前提**：如果所有处理器逻辑正确且与推理规则一致，结果应该是**确定的**，与查询顺序无关
+2. **非确定性 = bug**：如果查询顺序不同导致结果不同，说明**处理器存在 bug**
+3. **随机打乱的作用**：通过随机化前提查询顺序，**让 bug 更容易被触发和发现**
+4. **这是一种测试/调试机制**：而非性能优化，用于确保处理器逻辑的确定性
+
+---
+
+### 2. 循环结束后的多线程竞争补充检查
+
+**重要修正：原描述不够准确。需要明确循环结束后专门处理多线程竞争的兜底逻辑，以及 `InconsistentAssumptions` 与处理器 bug 的关系。**
+
+#### 问题场景分析
+
+在多线程环境下，可能发生以下情形：
+
+1. **线程 A** 正在查询 `fact = is_integer`
+2. **线程 B** 同时查询同一个对象的同一属性
+3. **线程 B** 先完成了某个前提事实（如 `is_rational`）的计算，并将结果写入缓存
+4. **线程 A** 在循环中检查到 `fact_i in assumptions`（该事实已由 B 完成），于是执行 `continue` 跳过
+5. **问题**：由于跳过了 `continue` 后的主逻辑，线程 A 可能错过了对目标事实 `fact` 的最终检查
+6. **风险**：目标事实 `fact` 可能已由线程 B 写入缓存，但线程 A 的主逻辑未能读取到
+
+#### 循环后的补充检查（兜底逻辑）
+
+代码中专门针对上述问题设计了兜底检查：
+
+```python
+# The above loop should be able to handle everything fine in a
+# single-threaded context but in multithreaded code it is possible that
+# this thread skipped computing a particular fact that was computed in
+# another thread (due to the continue). In that case it is possible that
+# fact was inferred and is now stored in the assumptions dict but it wasn't
+# checked for in the body of the loop. This is an obscure case but to make
+# sure we catch it we check once here at the end of the loop.
+if fact in assumptions:
+    return assumptions[fact]
+```
+
+**官方注释的准确解读：**
+
+| 条件 | 说明 |
+|------|------|
+| 单线程场景 | 主循环应能正确处理所有情况 |
+| 多线程场景 | 可能因 `continue` 跳过而遗漏检查 |
+| 遗漏情形 | 目标事实可能已由其他线程写入缓存，但本线程主逻辑未读取到 |
+| 兜底处理 | 循环结束后**专门补充检查** `if fact in assumptions` |
+
+#### 最终缓存冲突与处理器 bug
+
+当最终调用 `assumptions._tell(fact, None)` 时，若遭遇冲突抛出 `InconsistentAssumptions`：
+
+```python
+# This query can not be answered. It's possible that e.g. another thread
+# has already stored None for fact but assumptions._tell does not mind if
+# we call _tell twice setting the same value. If this raises
+# InconsistentAssumptions then it probably means that another thread
+# attempted to compute this and got a value of True or False rather than
+# None. In that case there must be a bug in at least one of the handlers.
+# If the handlers are all deterministic and are consistent with the
+# inference rules then the same value should be computed for fact in all
+# threads.
+assumptions._tell(fact, None)
+```
+
+**关键逻辑链：**
+
+| 层次 | 逻辑 |
+|------|------|
+| **正常竞争** | 若两个线程都算出 `None`，调用 `_tell` 两次设置相同值是安全的 |
+| **冲突发生** | 若一个线程算出 `None`，另一个线程算出 `True` 或 `False` → 冲突 |
+| **冲突含义** | 按注释说明，这意味着**存在处理器 bug**，而非正常竞争现象 |
+| **正确性前提** | 如果处理器都是确定的且与推理规则一致，所有线程应算出相同值 |
+
+#### 多线程处理策略完整总结
+
+| 场景 | 位置 | 处理方式 |
+|------|------|---------|
+| 其他线程已完成计算 | 循环内 | `fact_i in assumptions` → 跳过重新计算（`continue`） |
+| 因 `continue` 可能遗漏最终检查 | 循环后 | **专门兜底检查** `if fact in assumptions` |
+| 最终缓存时的线程冲突 | `_tell` 处 | 若抛出 `InconsistentAssumptions` → **处理器 bug**（非正常竞争） |
 
 #### 推理引擎：`deduce_all_facts`
 
