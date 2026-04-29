@@ -2053,6 +2053,637 @@ print(_aresame(expr1, expr2))  # False (类型不同)
 
 ---
 
+### 补充 D：v1.2 版修正说明
+
+#### D.1 并行替换解释的重大修正
+
+**v1.1 版的错误**：
+
+| 错误观点 | 正确理解 |
+|----------|----------|
+| 设计动机是"区分自由变量和绑定变量" | 设计动机是**利用 `_diff_wrt` 标记控制替换路径** |
+| 用 `d*m` 是为了让 Subs 识别"待替换"的变量 | 用 `d*m` 是因为**乘积的 `_diff_wrt = False`** |
+| 单个 Dummy 无法区分自由/绑定变量 | 单个 Dummy 的 `_diff_wrt = True`，会触发错误的替换路径 |
+
+**核心机制对比**：
+
+```python
+# 单个 Dummy：会走"直接重构绑定变量"路径
+d = Dummy('d')
+d._diff_wrt  # True（继承自 Symbol）
+Derivative(f(x), x)._subs(x, d)
+# 可能直接返回：Derivative(f(d), d) —— 绑定变量被改变！
+
+# 乘积形式：会走"返回 Subs 延迟对象"路径
+m = Dummy('m')
+(d*m)._diff_wrt  # False（Mul 默认值）
+Derivative(f(x), x)._subs(x, d*m)
+# 返回：Subs(Derivative(f(x), x), x, d*m) —— 绑定变量保全！
+```
+
+#### D.2 三个关键机制的完整理解
+
+经过修正后，并行替换的完整设计涉及三个相互配合的机制：
+
+| 机制 | 作用位置 | 关键功能 |
+|------|----------|----------|
+| **`_diff_wrt` 标记** | 表达式属性 | 决定是否可作为微分/积分/求和的绑定变量 |
+| **三种返回语义** | `_eval_subs` 方法 | 根据 `new._diff_wrt` 选择替换路径 |
+| **`d*m` 双层占位** | 并行替换实现 | 确保 `new._diff_wrt = False`，触发正确路径 |
+| **`hack2` + `evaluate=False`** | 后备递归保护 | 保持 `Mul` 形式，防止 `_diff_wrt` 属性丢失 |
+
+#### D.3 完整的路径选择流程图（修正版）
+
+**注意**：v1.2 版的流程图是简化版，实际情况因表达式类型而异。详细的三路对比见**补充 E**。
+
+```
+                    替换发生在含绑定变量的表达式中
+                                │
+                                ▼
+                    old 是绑定变量之一吗？
+                       /           \
+                      否            是
+                      │             │
+                      ▼             │
+              返回 None（后备递归） │
+                      │             │
+                      │             ▼
+                      │    new._diff_wrt 的值是？
+                      │           /    \
+                      │          是     否
+                      │          │      │
+                      │          ▼      ▼
+                      │    直接重构    返回非 None 值
+                      │    绑定变量    （终止后备递归）
+                      │
+                      └──────────┬──────────┘
+                                 ▼
+                        替换路径选择完成
+```
+
+#### D.4 修正总结
+
+| 版本 | 关键修正 |
+|------|----------|
+| **v1.0** | 初始版本，存在多处错误和遗漏 |
+| **v1.1** | 补充 Pow._eval_subs、并行占位、_aresame 差异 |
+| **v1.2** | **重大修正**：并行替换的设计动机是 `_diff_wrt` 标记机制，而非自由/绑定变量区分；补充三种返回语义分析 |
+| **v1.3** | **补充**：积分/求和类与微分类的绑定变量保护策略差异；三路对比分析 |
+
+---
+
+### 补充 E：v1.3 版 - 绑定变量保护策略的三路对比
+
+#### E.1 问题背景：三种返回语义的遗漏
+
+**v1.2 版的遗漏**：
+- 错误地认为"返回 Subs 延迟对象"是唯一的绑定变量保护方式
+- 实际上，积分/求和类表达式使用**不同的保护策略**
+- 核心机制是：**返回任意非 None 值均可终止后备递归**
+
+**关键发现**：
+
+| 表达式类型 | 当 `new._diff_wrt = False` 时的行为 | 返回值类型 |
+|------------|--------------------------------------|------------|
+| **Derivative（微分类）** | 返回 `Subs(self, old, new)` | Subs 对象（非 None） |
+| **Integral/Sum（积分/求和类）** | 创建冗余边界 `(old, old)`，返回重构的表达式 | 原类型对象（非 None） |
+| **普通表达式** | 返回 `None`，让 fallback 递归处理 | None |
+
+**核心机制**：所有**非 None** 的返回值都会终止后备递归，从而保护绑定变量不被进一步替换。
+
+---
+
+#### E.2 _subs 架构中的返回值语义
+
+**核心代码回顾**（`basic.py:1182-1292`）：
+
+```python
+@cacheit
+def _subs(self, old, new, **hints):
+    
+    def fallback(self, old, new):
+        """后备递归函数：递归处理所有子表达式"""
+        hit = False
+        args = list(self.args)
+        for i, arg in enumerate(args):
+            if not hasattr(arg, '_eval_subs'):
+                continue
+            arg = arg._subs(old, new, **hints)  # 递归调用 _subs
+            if not _aresame(arg, args[i]):
+                hit = True
+                args[i] = arg
+        if hit:
+            rv = self.func(*args)  # 重构表达式
+            return rv
+        return self
+    
+    # ========== 关键逻辑 ==========
+    if _aresame(self, old):
+        return new  # 快速返回
+    
+    rv = self._eval_subs(old, new)  # 调用类特定的 _eval_subs
+    
+    if rv is None:
+        rv = fallback(self, old, new)  # 返回 None → 执行后备递归
+    
+    return rv
+```
+
+**关键分析**：
+
+```
+_subs 执行流程：
+
+1. _aresame(self, old) 检查
+   ├── True → 直接返回 new（快速路径）
+   └── False → 继续
+
+2. 调用 self._eval_subs(old, new)
+   ├── 返回非 None → 使用该值，**跳过 fallback**
+   └── 返回 None → 执行 fallback（后备递归）
+
+3. fallback 执行（仅当 _eval_subs 返回 None 时）
+   └── 递归处理所有子表达式的 _subs
+```
+
+**核心洞察**：
+
+| _eval_subs 返回值 | fallback 是否执行 | 子表达式是否被进一步替换 | 效果 |
+|-------------------|-------------------|-------------------------|------|
+| **None** | ✅ 执行 | ✅ 子表达式被递归处理 | 自由替换 |
+| **非 None**（任意值） | ❌ 不执行 | ❌ 子表达式不被处理 | **保护绑定变量** |
+
+---
+
+#### E.3 积分/求和类的替换策略：冗余边界方式
+
+**核心代码**（`expr_with_limits.py:354-431`）：
+
+```python
+def _eval_subs(self, old, new):
+    func, limits = self.function, list(self.limits)
+    
+    # 反转 limits 以匹配数学作用域约定
+    limits.reverse()
+    
+    # ========== 关键判断：old 是否是非符号，或与自由符号相关 ==========
+    if not isinstance(old, Symbol) or \
+            old.free_symbols.intersection(self.free_symbols):
+        sub_into_func = True
+        
+        for i, xab in enumerate(limits):
+            # xab = (variable, [lower, upper]) 或 (variable,)
+            
+            if 1 == len(xab) and old == xab[0]:
+                # ========== 关键：old 是绑定变量（无上下限） ==========
+                
+                if new._diff_wrt:
+                    # case A: new 可以作为微分变量
+                    # → 直接替换绑定变量
+                    xab = (new,)
+                else:
+                    # case B: new 不能作为微分变量
+                    # → 创建冗余边界 (old, old)
+                    #    这表示"在 old 处求值"
+                    xab = (old, old)
+            
+            # 更新 limits：替换上下限中的符号
+            limits[i] = Tuple(xab[0], *[l._subs(old, new) for l in xab[1:]])
+            
+            # 检查是否需要继续替换被积函数
+            if len(xab[0].free_symbols.intersection(old.free_symbols)) != 0:
+                sub_into_func = False
+                break
+        
+        # 函数替换（如果允许）
+        if sub_into_func:
+            func = func.subs(old, new)
+    
+    else:
+        # old 是纯绑定变量（不在自由符号中）
+        for i, xab in enumerate(limits):
+            if len(xab) == 3:
+                # 有上下限：只替换上下限
+                limits[i] = Tuple(xab[0], *[l._subs(old, new) for l in xab[1:]])
+                if old == xab[0]:
+                    break  # 绑定变量不替换
+    
+    # ========== 简化冗余边界 ==========
+    # (x, x) → (x,) 表示"在 x 处求值"
+    for i, xab in enumerate(limits):
+        if len(xab) == 2 and (xab[0] - xab[1]).is_zero:
+            limits[i] = Tuple(xab[0], )
+    
+    # 反转回原顺序
+    limits.reverse()
+    
+    # ========== 关键：返回重构的表达式（非 None） ==========
+    return self.func(func, *limits)
+```
+
+**行为分析**：
+
+```
+场景：Integral(f(x, y), x).subs(x, z)
+         （不定积分，无上下限）
+
+old = x（绑定变量）
+new = z（假设 new._diff_wrt = True，因为 z 是 Symbol）
+
+执行路径：
+1. old 是 Symbol，检查是否在自由符号中
+   - 自由符号 = {y}，x 不在其中
+   - 但 limits 中 xab = (x,)，长度为 1
+   
+2. 检查 1 == len(xab) and old == xab[0] → True
+
+3. 检查 new._diff_wrt → True（Symbol）
+   
+4. 所以：xab = (new,) = (z,)  → 绑定变量被直接替换！
+
+5. 返回：Integral(f(x, y), z)
+   - 问题：被积函数中的 x 没有被替换！
+   - 因为 sub_into_func = False（绑定变量改变了）
+```
+
+**更复杂的场景**：
+
+```python
+from sympy import symbols, Integral, Sum
+from sympy.core.function import AppliedUndef
+x, y, z = symbols('x y z')
+
+# 场景1：不定积分 + 不能作为微分变量的 new
+from sympy import Dummy
+d = Dummy('d')
+m = Dummy('m')
+new = d * m  # new._diff_wrt = False
+
+expr = Integral(f(x, y), x)  # 不定积分：xab = (x,)
+result = expr._eval_subs(x, new)
+# xab 从 (x,) 变成 (x, x)（冗余边界）
+# 结果类似：Integral(f(x, y), (x, x))
+# 这表示"在 x 处求值"的抽象概念
+
+# 场景2：定积分
+expr2 = Integral(f(x, y), (x, 0, 10))  # xab = (x, 0, 10)
+result2 = expr2._eval_subs(x, new)
+# xab[0] = x（绑定变量）不替换
+# 只替换上下限：0 和 10 中的 x（但 0 和 10 是常数）
+# 被积函数 f(x, y) 中的 x：
+# - 如果 sub_into_func = True，会被替换
+# - 但 x 是绑定变量，所以 sub_into_func = False
+# - 所以 f(x, y) 保持不变！
+```
+
+**数学语义解释**：
+
+```
+积分/求和的数学约定：
+
+1. 不定积分 ∫f(x)dx：
+   - x 是"哑变量"（bound variable）
+   - ∫f(x)dx 和 ∫f(y)dy 表示相同的不定积分族
+   - 但直接替换绑定变量是有问题的！
+
+2. 定积分 ∫[a,b] f(x)dx：
+   - 改变积分变量需要同时改变被积函数
+   - ∫[0,10] f(x)dx ≠ ∫[0,10] f(y)dx（后者无意义）
+
+3. 点求值：
+   - Integral(f(x), (x, x)) 是"在 x 处求值"的抽象表示
+   - 这实际上是"不进行积分"的边界情况
+
+SymPy 的策略：
+- 当 new._diff_wrt = True 时：直接替换绑定变量（假设用户知道自己在做什么）
+- 当 new._diff_wrt = False 时：创建冗余边界，保持"待求值"状态
+- 两种情况都返回非 None 值，终止后备递归
+```
+
+---
+
+#### E.4 微分类的替换策略：Subs 延迟对象方式
+
+**核心代码**（`function.py:1718-1775`）：
+
+```python
+def _eval_subs(self, old, new):
+    # The substitution (old, new) cannot be done inside
+    # Derivative(expr, vars) for a variety of reasons
+    
+    if old in self._wrt_variables:
+        # old 是微分变量之一
+        
+        # 先处理计数中的替换
+        expr = self.func(self.expr, *[(v, c.subs(old, new))
+            for v, c in self.variable_count])
+        if expr != self:
+            return expr._eval_subs(old, new)
+        
+        # ========== 关键判断 ==========
+        if not getattr(new, '_diff_wrt', False):
+            # case (0): new is not a valid variable of differentiation
+            # new 不是有效的微分变量
+            
+            if isinstance(old, Symbol):
+                # don't introduce a new symbol if the old will do
+                # ========== 关键：返回 Subs 延迟对象 ==========
+                return Subs(self, old, new)
+            else:
+                # old 不是 Symbol，使用 Dummy 中间转换
+                xi = Dummy('xi')
+                return Subs(self.xreplace({old: xi}), xi, new)
+        
+        # case (1): new._diff_wrt = True，可以作为微分变量
+        # 这里继续处理直接替换的情况...
+        # ...
+```
+
+**行为分析**：
+
+```python
+from sympy import symbols, Derivative, Function, Subs
+x, y = symbols('x y')
+f = Function('f')
+
+# 场景1：new._diff_wrt = True
+d = Dummy('d')  # d._diff_wrt = True
+expr = Derivative(f(x, y), x)
+result = expr._eval_subs(x, d)
+# 可能直接返回：Derivative(f(d, y), d)
+# 绑定变量被直接替换！
+
+# 场景2：new._diff_wrt = False（并行替换场景）
+m = Dummy('m')
+new = d * m  # new._diff_wrt = False
+result2 = expr._eval_subs(x, new)
+# 返回：Subs(Derivative(f(x, y), x), x, d*m)
+# Derivative 结构被完整保全！
+```
+
+**Subs 对象的语义**：
+
+```
+Subs(expr, var, val) 表示"延迟替换"：
+- 保持 expr 的原结构不变
+- 记录"将 var 替换为 val"的操作
+- 只有在显式求值（.doit()）时才实际执行替换
+
+数学含义：
+- d/dx f(x) 在 x 被替换为不能作为微分变量的值时
+- 不能直接重构为 d/d(...) f(...)
+- 所以保持 Derivative 结构，用 Subs 包裹
+
+例如：
+Derivative(f(x), x).subs(x, x+y)
+→ 不能直接写成 Derivative(f(x+y), x+y)
+→ 因为 x+y 不是简单的微分变量
+→ 返回：Subs(Derivative(f(x), x), x, x+y)
+```
+
+---
+
+#### E.5 三路对比：微分类 vs 积分/求和类 vs 普通表达式
+
+##### 对比表
+
+| 维度 | **Derivative（微分类）** | **Integral/Sum（积分/求和类）** | **普通表达式** |
+|------|---------------------------|----------------------------------|----------------|
+| **绑定变量存在性** | 有（微分变量） | 有（积分/求和变量） | 无 |
+| **`new._diff_wrt = True` 时** | 直接重构绑定变量 | 直接重构绑定变量 | 无特殊处理 |
+| **`new._diff_wrt = False` 时** | 返回 `Subs(self, old, new)` | 创建冗余边界 `(old, old)` | 返回 `None` |
+| **返回值类型（保护时）** | `Subs` 对象 | 原类型对象（重构） | `None` |
+| **后备递归是否执行** | ❌ 不执行 | ❌ 不执行 | ✅ 执行 |
+| **绑定变量保护机制** | Subs 延迟对象"冻结"结构 | 冗余边界"点求值"语义 | 无绑定变量 |
+| **数学语义** | "无法构造微分，保持原结构" | "在某点求值"的抽象概念 | 自由替换 |
+
+##### 行为差异示例
+
+```python
+from sympy import symbols, Derivative, Integral, Sum, Function, Dummy
+x, y = symbols('x y')
+f, g = symbols('f g', cls=Function)
+
+# ========== 创建 new._diff_wrt = False 的替换目标 ==========
+d = Dummy('d')
+m = Dummy('m')
+new = d * m  # new._diff_wrt = False
+
+# ========== 场景1：微分类 ==========
+expr1 = Derivative(f(x, y), x)
+result1 = expr1._eval_subs(x, new)
+print("Derivative 结果:", result1)
+# 输出类似：Subs(Derivative(f(x, y), x), x, d*m)
+# 特点：
+# - Derivative 结构完整保全
+# - 用 Subs 包裹，表示"待替换"状态
+# - 返回值类型：Subs（非 None）
+
+# ========== 场景2：积分类（不定积分） ==========
+expr2 = Integral(f(x, y), x)  # xab = (x,)
+result2 = expr2._eval_subs(x, new)
+print("Integral（不定）结果:", result2)
+# 输出类似：Integral(f(x, y), (x, x))
+# 特点：
+# - 创建冗余边界 (x, x)
+# - 表示"在 x 处求值"的抽象概念
+# - 返回值类型：Integral（非 None，原类型）
+
+# ========== 场景3：积分类（定积分） ==========
+expr3 = Integral(f(x, y), (x, 0, 10))  # xab = (x, 0, 10)
+result3 = expr3._eval_subs(x, new)
+print("Integral（定）结果:", result3)
+# 输出类似：Integral(f(x, y), (x, 0, 10)) 或有变化
+# 特点：
+# - 绑定变量 x 保持不变
+# - 上下限 0 和 10 不包含 x，所以不变
+# - 被积函数 f(x, y) 中的 x：
+#   - 因为 x 是绑定变量，sub_into_func = False
+#   - 所以 f(x, y) 保持不变！
+
+# ========== 场景4：求和类 ==========
+from sympy import oo
+expr4 = Sum(x**k, (k, 1, 10))
+result4 = expr4._eval_subs(k, new)
+print("Sum 结果:", result4)
+# 行为类似 Integral
+
+# ========== 场景5：普通表达式（对比） ==========
+from sympy.core.add import Add
+expr5 = x + y
+result5 = expr5._eval_subs(x, new)
+print("普通 Add 结果:", result5)
+# 输出：None（Add 没有特殊的 _eval_subs，返回 None）
+# 然后 fallback 会执行：
+# - 递归处理 x → new
+# - 结果：new + y = d*m + y
+```
+
+##### 为什么两种不同的保护策略？
+
+**设计动机分析**：
+
+| 策略 | 适用场景 | 设计理由 |
+|------|----------|----------|
+| **Subs 延迟对象** | Derivative | 微分变量的改变需要特殊的数学处理<br>不能简单地"重命名"微分变量<br>保持 Derivative 结构，等待后续求值 |
+| **冗余边界** | Integral/Sum | 积分/求和变量有明确的"点求值"语义<br>`∫[x,x] f(x)dx` 表示 0 或"在 x 处"<br>保持原类型，数学上可理解 |
+
+**更深层的原因**：
+
+```
+1. 微分的数学特性：
+   - d/dx f(x) 中的 x 是"微分变量"
+   - 改变微分变量需要链式法则：d/dy f(g(y)) = f'(g(y)) * g'(y)
+   - 所以不能简单地"重命名"微分变量
+   - Subs(Derivative(f(x), x), x, y) 是正确的延迟表示
+
+2. 积分的数学特性：
+   - ∫f(x)dx 中的 x 是"哑变量"
+   - ∫f(x)dx 和 ∫f(y)dy 表示相同的积分族
+   - 但定积分 ∫[a,b] f(x)dx 不能随意改变变量
+   - 冗余边界 (x, x) 是"边界情况"的表示
+
+3. 统一的底层机制：
+   - 两种策略都返回非 None 值
+   - 都终止后备递归
+   - 都保护绑定变量不被进一步替换
+```
+
+---
+
+#### E.6 完整的 _subs 执行路径图
+
+```
+                         _subs(self, old, new)
+                                  │
+                                  ▼
+                    _aresame(self, old) 检查？
+                       /               \
+                     True              False
+                      │                 │
+                      ▼                 │
+                  返回 new              │
+                                        ▼
+                            self._eval_subs(old, new)
+                                        │
+                    ┌───────────────────┼───────────────────┐
+                    │                   │                   │
+                    ▼                   ▼                   ▼
+              返回 None         返回非 None（Subs）   返回非 None（重构）
+                    │                   │                   │
+                    ▼                   │                   │
+         fallback（后备递归）           │                   │
+                    │                   │                   │
+                    ▼                   ▼                   ▼
+         递归处理所有子表达式    直接返回 Subs，       直接返回重构对象，
+         包括绑定变量的位置      跳过 fallback         跳过 fallback
+                    │                   │                   │
+                    ▼                   ▼                   ▼
+         绑定变量可能被替换    绑定变量结构完整保全    绑定变量被"点求值"保护
+         （自由替换）          （Subs 延迟）           （冗余边界）
+```
+
+---
+
+#### E.7 与并行替换的配合机制
+
+**完整的配合链条**：
+
+```
+并行替换执行流程：
+
+1. subs({x: a, y: b}, simultaneous=True) 调用
+        │
+        ▼
+2. 创建标记符 m = Dummy('subs_m')
+   设置 kwargs['hack2'] = True
+        │
+        ▼
+3. 对每个替换 (old, new)：
+   a. 创建 d = Dummy('subs_d')
+   b. 用 d*m 替换 old
+      - 关键：(d*m)._diff_wrt = False
+      - 这会触发所有含绑定变量表达式的保护机制
+   c. 记录 reps[d] = new
+        │
+        ▼
+4. 执行 expr._subs(x, d*m, hack2=True)
+        │
+        ├───────────┬───────────┬───────────┐
+        │           │           │           │
+        ▼           ▼           ▼           ▼
+   Derivative    Integral      Sum         普通表达式
+        │           │           │           │
+        ▼           ▼           ▼           ▼
+   返回 Subs    返回重构    返回重构    返回 None
+   跳过 fallback 跳过 fallback 跳过 fallback  执行 fallback
+        │           │           │           │
+        ▼           ▼           ▼           ▼
+   结构保全     边界保护     边界保护     自由替换
+        │           │           │           │
+        └───────────┴───────────┴───────────┘
+                    │
+                    ▼
+5. 最后 xreplace({d1: a, d2: b, m: 1})
+        │
+        ▼
+   所有 d*m → a*1 → a
+   包括 Subs 内部和重构对象内部
+        │
+        ▼
+   完成并行替换
+```
+
+**为什么需要 `d*m` 而不是单独的 `d`**：
+
+```
+如果用单独的 d（Dummy）：
+- d._diff_wrt = True（继承自 Symbol）
+- Derivative._eval_subs 会走"直接重构绑定变量"路径
+- 结果：Derivative(f(d), d) —— 绑定变量被改变！
+- 被积函数 f(x) 中的 x 没有被替换！
+
+如果用 d*m（乘积）：
+- (d*m)._diff_wrt = False（Mul 默认）
+- Derivative._eval_subs 返回 Subs(Derivative(f(x), x), x, d*m)
+- 结构完整保全！
+- 最后 xreplace 时，d*m → a，Subs 可能被求值
+
+关键差异：
+- d._diff_wrt = True     → 直接替换绑定变量（危险）
+- (d*m)._diff_wrt = False → 触发保护机制（安全）
+```
+
+---
+
+#### E.8 v1.3 版修正总结
+
+**补充的关键内容**：
+
+1. **三种返回语义的完整理解**：
+   - `返回 None` → 执行 fallback 后备递归 → 自由替换
+   - `返回非 None（任意值）` → 跳过 fallback → 保护绑定变量
+
+2. **两种绑定变量保护策略**：
+   - **微分类**：返回 `Subs` 延迟对象 → 保全原结构
+   - **积分/求和类**：创建冗余边界 `(old, old)` → 点求值语义
+
+3. **三路对比的核心差异**：
+   | 类型 | 保护策略 | 返回值 | 数学语义 |
+   |------|----------|--------|----------|
+   | Derivative | Subs 延迟对象 | `Subs` 对象 | "无法构造微分" |
+   | Integral/Sum | 冗余边界 | 原类型对象 | "在某点求值" |
+   | 普通表达式 | 无保护 | `None` | 自由替换 |
+
+4. **与并行替换的配合**：
+   - `d*m` 确保 `new._diff_wrt = False`
+   - 触发所有含绑定变量表达式的保护机制
+   - 最后一次性 `xreplace` 完成替换
+
+---
+
 *报告生成时间: 2026-04-29*
 *基于 SymPy 版本: 本地代码库 (sympy-10062)*
-*补充分析版本: v1.1*
+*补充分析版本: v1.3*
+*最后修正: 绑定变量保护策略的三路对比*
+*最后修正: 并行替换设计动机的重大修正*
