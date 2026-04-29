@@ -1322,5 +1322,643 @@ replace 触发化简的可能点：
 
 ---
 
+---
+
+## 补充分析：三个遗漏边界的深度解析
+
+### 补充 A：Pow._eval_subs - 幂次表达式的独立替换路径
+
+#### A.1 设计复杂性概述
+
+`Pow._eval_subs` 是三条替换路径中实现最复杂的，涵盖以下三个核心维度：
+
+| 维度 | 处理能力 | 典型用例 |
+|------|----------|----------|
+| **指数比例匹配** | 同基数下的指数倍数关系 | `(x**6).subs(x**2, y)` → `y**3` |
+| **基数对数匹配** | 同指数下的基数对数关系 | `(4**x).subs(2**x, y)` → `y**2` |
+| **非交换余数处理** | 非交换符号的商余分解 | `(A**5).subs(A**2, B)` → `B**2 * A` |
+
+#### A.2 核心实现：`_check` 辅助函数
+
+```python
+# power.py:680-736
+def _check(ct1, ct2, old):
+    """
+    返回 (bool, pow, remainder_pow) 三元组：
+    - bool: 替换是否合法
+    - pow: 指数比例系数
+    - remainder_pow: 非交换情况下的余数部分
+    
+    cti = (coeff, terms) 是指数的系数-项分解
+    """
+    coeff1, terms1 = ct1
+    coeff2, terms2 = ct2
+    
+    if terms1 == terms2:  # 核心前提：变量部分必须完全相同
+        if old.is_commutative:
+            # ========== 交换对象处理 ==========
+            pow = coeff1 / coeff2  # 允许分数指数
+            
+            try:
+                as_int(pow, strict=False)
+                combines = True
+            except ValueError:
+                # 非整数指数时，需要确保幂次运算法则成立
+                b, e = old.as_base_exp()
+                # 条件：(b**e)**f == b**(e*f) 对任意 f 成立
+                combines = (b.is_positive and e.is_real) or \
+                          (b.is_nonnegative and e.is_nonnegative)
+            
+            return (combines, pow, None)
+        
+        else:
+            # ========== 非交换对象处理 ==========
+            # 只允许整数指数（非交换时分数指数无定义）
+            if not isinstance(terms1, tuple):
+                terms1 = (terms1,)
+            if not all(term.is_integer for term in terms1):
+                return (False, None, None)
+            
+            try:
+                # 向零取整的商余分解
+                pow, remainder = divmod(as_int(coeff1), as_int(coeff2))
+                if pow < 0 and remainder != 0:
+                    pow += 1
+                    remainder -= as_int(coeff2)
+                
+                if remainder == 0:
+                    remainder_pow = None
+                else:
+                    # 余数部分需要保留：old.base ** (remainder * terms)
+                    remainder_pow = Mul(remainder, *terms1)
+                
+                return (True, pow, remainder_pow)
+            except ValueError:
+                pass
+    
+    return (False, None, None)
+```
+
+#### A.3 指数比例匹配路径
+
+```python
+# power.py:750-760
+if isinstance(old, self.func) and self.base == old.base:
+    if self.exp.is_Add is False:
+        # 指数不是加法表达式，直接比例匹配
+        ct1 = self.exp.as_independent(Symbol, as_Add=False)
+        ct2 = old.exp.as_independent(Symbol, as_Add=False)
+        ok, pow, remainder_pow = _check(ct1, ct2, old)
+        
+        if ok:
+            # issue 5180: (x**(6*y)).subs(x**(3*y), z) -> z**2
+            result = self.func(new, pow)
+            if remainder_pow is not None:
+                result = Mul(result, Pow(old.base, remainder_pow))
+            return result
+```
+
+**示例行为**：
+
+```python
+from sympy import symbols, Integer
+x, y = symbols('x y')
+
+# 交换对象的分数指数
+expr1 = x**(S(3)/2)
+result1 = expr1.subs(x**(S(1)/2), y)
+print(result1)  # y**3
+
+# 非交换对象的商余分解
+A = symbols('A', commutative=False)
+expr2 = A**5
+result2 = expr2.subs(A**2, B)
+print(result2)  # B**2 * A (余数 1 保留)
+
+expr3 = A**7
+result3 = expr3.subs(A**3, B)
+print(result3)  # B**2 * A (7 = 3*2 + 1)
+```
+
+#### A.4 基数对数匹配路径
+
+```python
+# power.py:744-748
+# issue 10829: (4**x - 3*y + 2).subs(2**x, y) -> y**2 - 3*y + 2
+if isinstance(old, self.func) and self.exp == old.exp:
+    l = log(self.base, old.base)  # 关键：计算对数比例
+    if l.is_Number:
+        return Pow(new, l)
+```
+
+**数学原理**：
+- 若 `old.base^exp` 匹配 `old`，且 `self.base^exp` 是当前表达式
+- 则 `log(self.base, old.base)` 给出基数的比例系数
+- 结果为 `new ** log(self.base, old.base)`
+
+```python
+from sympy import symbols, log
+x = symbols('x')
+
+# 2^x 匹配，4^x = (2^x)^2
+expr = 4**x
+result = expr.subs(2**x, y)
+print(result)  # y**2 (因为 log(4, 2) = 2)
+
+# 9^x = (3^x)^2
+expr2 = 9**x
+result2 = expr2.subs(3**x, z)
+print(result2)  # z**2
+```
+
+#### A.5 指数为 Add 时的拆分处理
+
+```python
+# power.py:761-784
+else:  # b**(6*x + a).subs(b**(3*x), y) -> y**2 * b**a
+    oarg = old.exp
+    new_l = []  # 匹配成功的部分
+    o_al = []   # 未匹配的部分
+    
+    ct2 = oarg.as_coeff_mul()
+    for a in self.exp.args:
+        newa = a._subs(old, new)  # 先递归替换子表达式
+        ct1 = newa.as_coeff_mul()
+        ok, pow, remainder_pow = _check(ct1, ct2, old)
+        
+        if ok:
+            new_l.append(new**pow)
+            if remainder_pow is not None:
+                o_al.append(remainder_pow)
+            continue
+        elif not old.is_commutative and not newa.is_integer:
+            # 非交换时，任何非整数项都会导致整个替换失败
+            return
+        o_al.append(newa)
+    
+    if new_l:
+        expo = Add(*o_al)
+        new_l.append(Pow(self.base, expo, evaluate=False) if expo != 1 else self.base)
+        return Mul(*new_l)
+```
+
+```python
+from sympy import symbols, exp
+x, a = symbols('x a')
+
+# 指数加法拆分
+expr = x**(6*x + a)
+result = expr.subs(x**(3*x), y)
+print(result)  # y**2 * x**a
+
+# exp 嵌套情况
+expr2 = exp(exp(x) + exp(x**2))
+result2 = expr2.subs(exp(exp(x)), w)
+print(result2)  # w * exp(exp(x**2))
+```
+
+#### A.6 基数直接替换与 exp 函数匹配
+
+```python
+# power.py:738-742
+if old == self.base or (old == exp and self.base == S.Exp1):
+    if new.is_Function and isinstance(new, Callable):
+        return new(self.exp._subs(old, new))
+    else:
+        return new**self.exp._subs(old, new)
+
+# power.py:786-795
+# (2**x).subs(exp(x*log(2)), z) -> z
+if (isinstance(old, exp) or (old.is_Pow and old.base is S.Exp1)) \
+        and self.exp.is_extended_real and self.base.is_positive:
+    ct1 = old.exp.as_independent(Symbol, as_Add=False)
+    ct2 = (self.exp * log(self.base)).as_independent(Symbol, as_Add=False)
+    ok, pow, remainder_pow = _check(ct1, ct2, old)
+    if ok:
+        result = self.func(new, pow)
+        if remainder_pow is not None:
+            result = Mul(result, Pow(old.base, remainder_pow))
+        return result
+```
+
+**关键点**：
+- `e**x` 在 SymPy 中内部表示为 `exp(x)` 或 `Pow(S.Exp1, x)`
+- 需要处理这两种表示之间的等价性
+
+---
+
+### 补充 B：并行替换的双层间接占位实现
+
+#### B.1 设计动机：自由变量与绑定变量的冲突
+
+**问题场景**：
+
+```python
+from sympy import symbols, Derivative, Function
+x, y = symbols('x y')
+f = Function('f')
+
+# x 既是自由变量又是绑定变量
+expr = Derivative(f(x, y), x)
+
+# 目标：只替换自由出现的 x，不替换求导变量
+# 或者：需要区分不同上下文中的 x
+```
+
+**如果只用简单 Dummy 的问题**：
+1. 简单 Dummy 替换无法区分自由变量和绑定变量
+2. `Subs` 表达式（延迟替换）需要正确识别哪些变量需要替换
+
+#### B.2 双层占位实现详解
+
+```python
+# basic.py:1155-1173
+if simultaneous:  # XXX should this be the default for dict subs?
+    reps = {}
+    rv = self
+    kwargs['hack2'] = True
+    
+    # ========== 关键设计：双层占位 ==========
+    m = Dummy('subs_m')  # 标记符 Dummy，最终会被 1 替换
+    
+    for old, new in sequence:
+        com = new.is_commutative
+        if com is None:
+            com = True
+        
+        d = Dummy('subs_d', commutative=com)  # 实际占位 Dummy
+        
+        # ========== 核心技巧 ==========
+        # 使用 d*m 而不是简单的 d
+        # 这样 Subs 表达式可以正确处理绑定变量
+        rv = rv._subs(old, d*m, **kwargs)
+        
+        if not isinstance(rv, Basic):
+            break
+        
+        reps[d] = new  # 记录实际替换
+    
+    # 最后一步：用 1 替换标记符 m
+    reps[m] = S.One
+    return rv.xreplace(reps)
+```
+
+#### B.3 为什么 `d*m` 而不是 `d`
+
+**技术细节**：
+
+```python
+# 考虑表达式：Derivative(f(x, y), x)
+# 其中：
+# - 第一个 x 是自由变量（f 的参数）
+# - 第二个 x 是绑定变量（求导变量）
+
+# 简单 Dummy 替换：
+# expr._subs(x, d) 可能导致：
+# - 所有 x 都被替换，或者
+# - 无法正确构建 Subs 表达式
+
+# 双层占位 d*m：
+# expr._subs(x, d*m) 后：
+# - 自由位置的 x 被替换为 d*m
+# - Subs 表达式可以通过检查 m 的存在来识别哪些是"待替换"的
+
+# 最后 xreplace({d: new, m: 1}):
+# - d*m → new*1 → new
+# - 正确的变量被替换
+```
+
+#### B.4 hack2 参数的作用
+
+```python
+# basic.py:1158
+kwargs['hack2'] = True
+
+# 在 fallback 中使用：
+# basic.py:1269-1282
+def fallback(self, old, new):
+    # ...
+    if hit:
+        rv = self.func(*args)
+        hack2 = hints.get('hack2', False)
+        
+        # 2-arg hack：处理 Mul 求值为 0 或 1 的特殊情况
+        if hack2 and self.is_Mul and not rv.is_Mul:
+            coeff = S.One
+            nonnumber = []
+            for i in args:
+                if i.is_Number:
+                    coeff *= i
+                else:
+                    nonnumber.append(i)
+            nonnumber = self.func(*nonnumber)
+            if coeff is S.One:
+                return nonnumber
+            else:
+                return self.func(coeff, nonnumber, evaluate=False)
+        return rv
+    return self
+```
+
+**hack2 的目的**：
+- 确保 `d*m` 这样的乘积在替换过程中保持为 `Mul` 对象
+- 即使 `d` 或 `m` 被替换为 0 或 1，也不会过早求值
+- 保证最后一步 `xreplace` 能正确应用所有替换
+
+#### B.5 完整执行流程示例
+
+```python
+from sympy import symbols, Derivative, Function
+x, y, z = symbols('x y z')
+f = Function('f')
+
+# 原始表达式
+expr = Derivative(f(x, y), x) + z
+
+# 并行替换
+result = expr.subs({x: a, y: b}, simultaneous=True)
+# 期望：Derivative(f(a, b), x) + z 或类似（取决于绑定变量处理）
+
+# 内部执行步骤：
+#
+# 1. 创建标记符 m = Dummy('subs_m')
+#
+# 2. 处理第一个替换 x→a:
+#    - 创建 d1 = Dummy('subs_d')
+#    - 执行 expr._subs(x, d1*m, hack2=True)
+#    - 结果中自由出现的 x 被替换为 d1*m
+#    - 绑定变量 x（求导变量）可能保持不变或特殊处理
+#    - 记录 reps[d1] = a
+#
+# 3. 处理第二个替换 y→b:
+#    - 创建 d2 = Dummy('subs_d')
+#    - 执行 expr._subs(y, d2*m, hack2=True)
+#    - 记录 reps[d2] = b
+#
+# 4. 最后一步：xreplace({d1: a, d2: b, m: 1})
+#    - d1*m → a*1 → a
+#    - d2*m → b*1 → b
+#    - 完成所有替换
+```
+
+---
+
+### 补充 C：_aresame 精确同一性与数学相等的语义差异
+
+#### C.1 核心差异定义
+
+```python
+# basic.py:2203-2226
+def is_same(self, b, approx=False):
+    """
+    精确同一性检查：
+    - 不是简单的数学相等
+    - 要求类型完全相同 + 值完全相同
+    """
+    from .numbers import Number
+    from .traversal import postorder_traversal as pot
+    
+    for t in zip_longest(pot(a), pot(b)):
+        if None in t:
+            return False
+        
+        a, b = t
+        
+        if isinstance(a, Number):
+            if not isinstance(b, Number):
+                return False
+            if approx:
+                return approx(a, b)
+        
+        # ========== 关键判断 ==========
+        # 要求：值相等 且 类型完全相同
+        if not (a == b and a.__class__ == b.__class__):
+            return False
+    
+    return True
+
+_aresame = Basic.is_same  # 别名，供其他模块导入
+```
+
+#### C.2 两种相等性的对比
+
+| 维度 | 数学相等 (`==`) | 精确同一 (`_aresame`) |
+|------|-----------------|----------------------|
+| **判断标准** | 数学值相等 | 结构完全相同 + 类型完全相同 |
+| **类型检查** | 不检查类型 | 要求 `a.__class__ == b.__class__` |
+| **整数与浮点数** | `1 == 1.0` → `True` | `_aresame(Integer(1), Float(1.0))` → `False` |
+| **分数与小数** | `Rational(1,10) == 0.1` 通常 `False` | 更严格 |
+| **不同表示** | `S.Pi == pi` → `True` | 取决于类型 |
+| **用途** | 数学语义判断 | 缓存键、快速替换路径 |
+
+#### C.3 对替换路径的影响
+
+```python
+# basic.py:1182-1292
+@cacheit
+def _subs(self, old, new, **hints):
+    
+    def fallback(self, old, new):
+        # ...
+        for i, arg in enumerate(args):
+            # ...
+            arg = arg._subs(old, new, **hints)
+            
+            # ========== 关键：_aresame 检查 ==========
+            if not _aresame(arg, args[i]):
+                hit = True
+                args[i] = arg
+        # ...
+    
+    # ========== 快速返回路径 ==========
+    if _aresame(self, old):
+        return new  # 精确匹配，直接返回
+    
+    rv = self._eval_subs(old, new)
+    if rv is None:
+        rv = fallback(self, old, new)
+    return rv
+```
+
+**影响场景**：
+
+| 场景 | 数学相等 | 精确同一 | 行为 |
+|------|----------|----------|------|
+| `self == old` 但类型不同 | `True` | `False` | 绕过快速返回，走 fallback 递归 |
+| 数字类型不同 | 可能 `True` | `False` | 触发完整递归替换 |
+| 同一对象的不同表示 | 可能 `True` | 可能 `False` | 影响缓存命中 |
+
+#### C.4 对缓存失效边界的影响
+
+##### 缓存键的计算
+
+```python
+# cache.py 使用 functools.lru_cache
+# 缓存键依赖于参数的 __hash__ 和 __eq__
+
+@cacheit
+def _subs(self, old, new, **hints):
+    # 缓存键 = (self, old, new, **hints) 的不可变表示
+    # lru_cache 使用参数的 __hash__ 来存储和查找
+```
+
+**关键问题**：
+1. `_subs` 被 `lru_cache` 装饰，缓存键是参数的哈希
+2. 但方法内部使用 `_aresame` 进行精确同一性检查
+3. 这两者可能不一致
+
+##### 实际影响示例
+
+```python
+from sympy import symbols, Integer, Float, Rational
+from sympy.core.basic import _aresame
+from sympy.core.cache import clear_cache
+
+x = symbols('x')
+int_1 = Integer(1)
+float_1 = Float(1.0)
+
+# ========== 场景1：数学相等但类型不同 ==========
+print(int_1 == float_1)        # True (数学相等)
+print(_aresame(int_1, float_1)) # False (类型不同)
+
+# 缓存影响：
+expr1 = x + int_1
+expr2 = x + float_1
+
+# 这两个表达式的 _subs 缓存是分开的
+# 因为 self 参数不同（Integer(1) vs Float(1.0)）
+
+# ========== 场景2：快速返回路径的影响 ==========
+# 假设 old = Integer(1), self = Float(1.0)
+# _aresame(self, old) → False
+# 所以不会走快速返回路径
+# 会调用 _eval_subs，然后可能 fallback
+
+# ========== 场景3：数值与分数 ==========
+tenth1 = Rational(1, 10)
+tenth2 = Float(0.1)  # 注意：0.1 在二进制浮点中不精确
+
+print(tenth1 == tenth2)  # 通常 False (浮点精度问题)
+print(_aresame(tenth1, tenth2))  # False (类型不同)
+
+# 但如果是精确的：
+from sympy import S
+half1 = Rational(1, 2)
+half2 = Float(0.5)  # 0.5 可以精确表示
+
+print(half1 == half2)  # True
+print(_aresame(half1, half2))  # False (类型不同)
+```
+
+##### 缓存失效的边界条件
+
+| 条件 | 缓存行为 | 替换行为 |
+|------|----------|----------|
+| `_aresame(self, old)` → `True` | - | 快速返回 `new` |
+| `_aresame(self, old)` → `False` 但 `self == old` | 缓存键可能不同 | 走 `_eval_subs` → `fallback` |
+| 参数类型不同 | 缓存分开存储 | 精确匹配失败，可能触发递归 |
+| `clear_cache()` 调用 | 全部失效 | - |
+| 不可哈希参数 | 绕过缓存 | 正常执行 |
+
+#### C.5 后序遍历的深度检查
+
+```python
+# basic.py:2203-2226
+def is_same(self, b, approx=False):
+    from .traversal import postorder_traversal as pot
+    
+    # 使用后序遍历比较所有节点
+    for t in zip_longest(pot(a), pot(b)):
+        if None in t:
+            return False  # 结构深度不同
+        
+        a, b = t
+        
+        # 对于数字，额外检查类型
+        if isinstance(a, Number):
+            if not isinstance(b, Number):
+                return False
+            if approx:
+                return approx(a, b)
+        
+        # 关键：同时检查值相等和类型相等
+        if not (a == b and a.__class__ == b.__class__):
+            return False
+    
+    return True
+```
+
+**深度检查的意义**：
+- `_aresame` 不仅仅比较根节点
+- 它使用 `postorder_traversal` 遍历整个表达式树
+- 每个节点都必须满足 `a == b and a.__class__ == b.__class__`
+- 这确保了完全的结构同一性
+
+```python
+from sympy import symbols, Integer, Rational
+from sympy.core.basic import _aresame
+
+x = symbols('x')
+
+# 表达式1：x + 1（整数）
+expr1 = x + Integer(1)
+
+# 表达式2：x + 1.0（浮点数）
+expr2 = x + Float(1.0)
+
+print(expr1 == expr2)  # True (数学上相等)
+print(_aresame(expr1, expr2))  # False (类型不同)
+
+# 后序遍历比较：
+# expr1: [x, 1, x+1]
+# expr2: [x, 1.0, x+1.0]
+# 比较时：
+# x == x → True, type 相同
+# 1 == 1.0 → True, 但 Integer != Float → False
+# 整体返回 False
+```
+
+#### C.6 边界情况总结
+
+| 边界情况 | 数学相等 (`==`) | 精确同一 (`_aresame`) | 缓存影响 |
+|----------|-----------------|----------------------|----------|
+| `Integer(1)` vs `Float(1.0)` | `True` | `False` | 分开缓存 |
+| `Rational(1,2)` vs `Float(0.5)` | `True` | `False` | 分开缓存 |
+| 同类型不同值 | `False` | `False` | 不同键 |
+| 表达式结构不同 | 可能 `False` | `False` | 不同键 |
+| `approx=True` 时 | - | 近似比较 | - |
+
+**关键设计决策**：
+1. `_aresame` 用于**快速路径判断**和**变化检测**
+2. 严格的类型检查确保：
+   - 不会错误地跳过必要的递归
+   - 缓存键的区分度足够
+   - 避免潜在的精度问题（整数 vs 浮点数）
+
+---
+
+## 修正说明
+
+### 报告错误修正
+
+1. **Pow._eval_subs 的归属错误**：
+   - 原报告错误地将幂次匹配示例归属到 `Mul._eval_subs`
+   - 实际上，`(x**4).subs(x**2, y) == y**2` 是由 `Pow._eval_subs` 处理的
+   - `Mul._eval_subs` 处理的是乘积因子的匹配，如 `(x*y*z).subs(x*y, 1)`
+
+2. **并行替换的实现细节**：
+   - 原报告简单描述为"使用 Dummy 避免中间结果影响"
+   - 实际实现是**双层间接占位**：`d*m`（占位符 × 标记符）
+   - 设计动机是处理**自由变量与绑定变量的冲突**（如 `Derivative` 中的变量）
+
+3. **缓存失效边界的遗漏**：
+   - 原报告未覆盖 `_aresame` 与数学相等的差异
+   - 这是缓存失效的**关键边界条件**：类型不同但值相等的对象会绕过快速路径
+   - 直接影响 `_subs` 的缓存命中和执行路径选择
+
+---
+
 *报告生成时间: 2026-04-29*
 *基于 SymPy 版本: 本地代码库 (sympy-10062)*
+*补充分析版本: v1.1*
