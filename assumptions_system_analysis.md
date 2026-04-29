@@ -627,14 +627,291 @@ def _eval_is_zero_infinite_helper(self):
     return seen_zero, seen_infinite
 ```
 
-**更多乘法属性推断：**
+### 6.2 乘法节点有理数与无理数推断
 
-| 属性 | 推断逻辑 |
-|------|---------|
-| `is_integer` | 所有因子都是整数 → 是整数；如有一个是无理数 → 非整数 |
-| `is_rational` | 所有因子都是有理数且非零 → 是有理数 |
-| `is_positive` | 负因子个数为偶数且无零 → 正数 |
-| `is_commutative` | 所有因子可交换 → 可交换 |
+**重要修正：原报告关于有理数推断的描述有误，且完全缺席了无理数判断路径。**
+
+#### 有理数推断逻辑
+
+文件位置：`sympy/core/mul.py:1400-1407`
+
+```python
+def _eval_is_rational(self):
+    r = _fuzzy_group((a.is_rational for a in self.args), quick_exit=True)
+    if r:
+        return r
+    elif r is False:
+        # All args except one are rational
+        if all(a.is_zero is False for a in self.args):
+            return False
+```
+
+**正确逻辑：**
+
+| 场景 | 条件 | 结果 |
+|------|------|------|
+| 所有因子为有理数 | `_fuzzy_group` 返回 `True` | 直接返回 `True` |
+| 恰好一个因子非有理 | `_fuzzy_group` 返回 `False` | **需要非零检查** |
+| 混合（含零） | `r is False` 但有零因子 | 返回 `None`（无法确定） |
+
+**关键修正：**
+
+- ❌ 原错误："所有因子有理且非零才有理"
+- ✅ 正确：**全为有理数时直接得出有理，与是否含零无关**（有理数 × 0 = 0，0 是有理数）
+- ✅ 补充：**需要非零条件的是另一个方向**——当恰好一个因子非有理时，需要所有因子均非零才能得出非有理
+
+**数学原理：**
+- 有理数 × 有理数 = 有理数（包括零：0 是有理数）
+- 有理数 × 无理数 = 无理数（但 0 × 无理数 = 0，是有理数！）
+- 因此当有零因子时，即使其他因子非有理，结果也可能是有理数
+
+#### 无理数推断逻辑（原报告完全缺席）
+
+文件位置：`sympy/core/mul.py:1580-1592`
+
+```python
+def _eval_is_irrational(self):
+    for t in self.args:
+        a = t.is_irrational
+        if a:
+            others = list(self.args)
+            others.remove(t)
+            # 关键：其他因子必须是有理且非零
+            if all((x.is_rational and fuzzy_not(x.is_zero)) is True for x in others):
+                return True
+            return
+        if a is None:
+            return
+    if all(x.is_real for x in self.args):
+        return False
+```
+
+**完整的无理数判断逻辑：**
+
+| 条件 | 结果 |
+|------|------|
+| 存在一个无理因子 **且** 其他因子均为有理且非零 | `True` |
+| 存在一个无理因子但其他因子可能含零或非有理 | `None` |
+| 所有因子均为实数但都不是无理数 | `False` |
+| 任何因子的 `is_irrational` 为 `None` | `None` |
+
+**关键洞察：**
+- 无理数 × 有理数（非零）= 无理数
+- 但：无理数 × 0 = 0（有理数）
+- 但：无理数 × 无理数 = 不确定（√2 × √2 = 2 是整数，√2 × √3 = √6 是无理数）
+
+### 6.3 乘法节点整数判定的实际机制
+
+**重要修正：原报告描述过于简化，实际算法远比简单逐因子检查复杂。**
+
+文件位置：`sympy/core/mul.py:1418-1498`
+
+```python
+# 注释说明：简单逐因子检查不足够
+# without involving odd/even checks this code would suffice:
+#_eval_is_integer = lambda self: _fuzzy_group(
+#    (a.is_integer for a in self.args), quick_exit=True)
+
+def _eval_is_integer(self):
+    # 阶段 1: 先排除非有理情况
+    is_rational = self._eval_is_rational()
+    if is_rational is False:
+        return False
+
+    # 阶段 2: 拆分分子和分母
+    numerators = []
+    denominators = []
+    unknown = False
+    
+    for a in self.args:
+        hit = False
+        if a.is_integer:
+            if abs(a) is not S.One:
+                numerators.append(a)
+        elif a.is_Rational:
+            n, d = a.as_numer_denom()
+            if abs(n) is not S.One:
+                numerators.append(n)
+            if d is not S.One:
+                denominators.append(d)
+        elif a.is_Pow:
+            b, e = a.as_base_exp()
+            if not b.is_integer or not e.is_integer:
+                hit = unknown = True
+            if e.is_negative:
+                denominators.append(2 if a is S.Half else
+                    Pow(a, S.NegativeOne))
+            elif not hit:
+                # int b and pos int e: a = b**e is integer
+                ...
+            else:
+                return
+        else:
+            return
+
+    # 阶段 3: 无分母直接为整数
+    if not denominators and not unknown:
+        return True
+
+    # 阶段 4: 用 2 的幂次和奇偶性判断
+    allodd = lambda x: all(i.is_odd for i in x)
+    alleven = lambda x: all(i.is_even for i in x)
+    anyeven = lambda x: any(i.is_even for i in x)
+
+    from .relational import is_gt
+    
+    # 子情况 1: 有分母且分母 > 1，无分子 → 非整数
+    if not numerators and denominators and all(
+            is_gt(_, S.One) for _ in denominators):
+        return False
+    elif unknown:
+        return
+    
+    # 子情况 2: 分子全奇、分母含偶 → 非整数
+    elif allodd(numerators) and anyeven(denominators):
+        return False
+    
+    # 子情况 3: 分子含偶、分母是 2 → 整数（偶数 / 2 = 整数）
+    elif anyeven(numerators) and denominators == [2]:
+        return True
+    
+    # 子情况 4: 分子全偶、分母全奇、分母 > 1 → 非整数
+    elif alleven(numerators) and allodd(denominators
+            ) and (Mul(*denominators, evaluate=False) - 1
+            ).is_positive:
+        return False
+    
+    # 子情况 5: 单分母是 2 的幂，比较 2 的指数
+    if len(denominators) == 1:
+        d = denominators[0]
+        if d.is_Integer:
+            is_power_of_two = d.p & (d.p - 1) == 0
+            # if minimal power of 2 in num vs den is not
+            # negative then we have an integer
+            if is_power_of_two and (Add(*[i.as_base_exp()[1] for i in
+                    numerators if i.is_even]) - trailing(d.p)
+                    ).is_nonnegative:
+                return True
+    
+    # 子情况 6: 单分子是偶数，比较 2 的指数
+    if len(numerators) == 1:
+        n = numerators[0]
+        if n.is_Integer and n.is_even:
+            # if minimal power of 2 in den vs num is positive
+            # then we have have a non-integer
+            if (Add(*[i.as_base_exp()[1] for i in
+                    denominators if i.is_even]) - trailing(n.p)
+                    ).is_positive:
+                return False
+```
+
+**算法概览：**
+
+| 阶段 | 逻辑 | 目的 |
+|------|------|------|
+| **阶段 1** | `_eval_is_rational()` 非有理直接返回 `False` | 快速排除非整数 |
+| **阶段 2** | 遍历各因子，拆分 `numerators` 和 `denominators` | 分离分子分母部分 |
+| **阶段 3** | `not denominators and not unknown` | 无分母直接为整数 |
+| **阶段 4** | 基于**奇偶性**和**2 的幂次**的精细判断 | 处理分数情况 |
+
+**关键的 2 的幂次判断：**
+
+对于形如 `(偶数^a) / (2^b)` 的乘法：
+- 若 `a >= b` → 整数（如 `(4^2) / (2^3) = 16/8 = 2`）
+- 若 `a < b` → 非整数（如 `(2^1) / (2^2) = 2/4 = 0.5`）
+
+### 6.4 乘法节点正负号判定的辅助方法
+
+**重要修正：原报告描述为"负因子偶数个且无零即为正"，实际通过统一的辅助方法实现，追踪状态量而非计数。**
+
+文件位置：`sympy/core/mul.py:1594-1648`
+
+```python
+def _eval_is_extended_positive(self):
+    """Return True if self is positive, False if not, and None if it
+    cannot be determined.
+
+    Explanation
+    ===========
+
+    This algorithm is non-recursive and works by keeping track of the
+    sign which changes when a negative or nonpositive is encountered.
+    Whether a nonpositive or nonnegative is seen is also tracked since
+    the presence of these makes it impossible to return True, but
+    possible to return False if the end result is nonpositive. e.g.
+
+        pos * neg * nonpositive -> pos or zero -> None is returned
+        pos * neg * nonnegative -> neg or zero -> False is returned
+    """
+    return self._eval_pos_neg(1)
+
+def _eval_is_extended_negative(self):
+    return self._eval_pos_neg(-1)
+```
+
+**统一的辅助方法 `_eval_pos_neg(sign)`：**
+
+```python
+def _eval_pos_neg(self, sign):
+    saw_NON = saw_NOT = False
+    for t in self.args:
+        if t.is_extended_positive:
+            continue  # 正数，符号不变
+        elif t.is_extended_negative:
+            sign = -sign  # 负数，翻转符号
+        elif t.is_zero:
+            # 零的特殊处理：所有因子有限则返回 False（0 非正非负）
+            if all(a.is_finite for a in self.args):
+                return False
+            return  # 有无限因子，无法确定
+        elif t.is_extended_nonpositive:
+            sign = -sign
+            saw_NON = True  # 标记：可能为零
+        elif t.is_extended_nonnegative:
+            saw_NON = True  # 标记：可能为零
+        elif t.is_positive is False:
+            sign = -sign
+            if saw_NOT:
+                return
+            saw_NOT = True
+        elif t.is_negative is False:
+            if saw_NOT:
+                return
+            saw_NOT = True
+        else:
+            return  # 任何不确定，整体不确定
+    
+    # 最终判断
+    if sign == 1 and saw_NON is False and saw_NOT is False:
+        return True   # 确定为正
+    if sign < 0:
+        return False  # 确定为非正（负或零）
+```
+
+**追踪的状态量：**
+
+| 状态量 | 含义 | 影响 |
+|--------|------|------|
+| `sign` | 当前累积符号（1 或 -1） | 最终符号的判断基础 |
+| `saw_NON` | 是否见到 `nonpositive` 或 `nonnegative` | 若为 `True`，无法返回 `True`（可能为零） |
+| `saw_NOT` | 是否见到 `is_positive is False` 等 | 处理边界情况 |
+
+**示例分析：**
+
+| 表达式 | 实际含义 | 结果 |
+|--------|---------|------|
+| `pos * neg * nonpositive` | `正 × 负 × (负或零)` → `负或零` | 无法确定为正或负 → `None` |
+| `pos * neg * nonnegative` | `正 × 负 × (正或零)` → `负或零` | 确定非正 → `False` |
+| `pos * neg` | `正 × 负 = 负` | 确定非正 → `False` |
+| `pos * pos` | `正 × 正 = 正` | 确定为正 → `True` |
+
+**零与无穷共存的处理：**
+- 若存在零因子且所有因子有限 → 返回 `False`（0 既非正也非负）
+- 若存在零因子但有无限因子 → 返回 `None`（0 × ∞ 是未定式）
+
+### 6.5 加法节点（Add）的假设传播
+
+文件位置：`sympy/core/add.py:646-888`
 
 ### 6.3 加法节点（Add）的假设传播
 
