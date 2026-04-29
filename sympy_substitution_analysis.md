@@ -1547,88 +1547,203 @@ if (isinstance(old, exp) or (old.is_Pow and old.base is S.Exp1)) \
 
 ---
 
-### 补充 B：并行替换的双层间接占位实现
+### 补充 B：并行替换的双层间接占位实现（修正版）
 
-#### B.1 设计动机：自由变量与绑定变量的冲突
+#### B.1 原始解释的错误修正
 
-**问题场景**：
+**原报告的错误**：
+- 错误地将设计动机归因于"区分自由变量和绑定变量"
+- 实际设计动机是**利用 `_diff_wrt` 标记机制控制替换路径**
+- 核心差异在于：单个哑元符号具备"可作为微分变量"的标记，而乘积形式不具备
+
+#### B.2 核心机制：`_diff_wrt` 标记
+
+**什么是 `_diff_wrt`？**
+
+`_diff_wrt`（differentiate with respect to 的缩写）是一个属性，用于标记一个表达式是否**可以作为微分/积分/求和等操作的绑定变量**。
+
+```python
+# symbol.py:298-310
+class Symbol(Expr):
+    # ...
+    @property
+    def _diff_wrt(self) -> bool:
+        """Allow derivatives wrt Symbols."""
+        return True
+
+# function.py:441-443
+class Application(Basic):
+    # ...
+    @property
+    def _diff_wrt(self):
+        return False  # 默认值
+
+# function.py:854-869
+class AppliedUndef(Application):
+    # ...
+    @property
+    def _diff_wrt(self):
+        """Allow derivatives wrt to undefined functions."""
+        return True  # 未定义函数（如 f(x)）可以作为微分变量
+
+# function.py:1232-1263
+class Derivative(Expr):
+    # ...
+    @property
+    def _diff_wrt(self):
+        """An expression may be differentiated wrt a Derivative if
+        it is in elementary form."""
+        return self.expr._diff_wrt and isinstance(self.doit(), Derivative)
+```
+
+**关键对比**：
+
+| 表达式类型 | `_diff_wrt` 值 | 能否作为微分变量 |
+|------------|----------------|------------------|
+| `Symbol('x')` | `True` | ✅ 能 |
+| `Dummy('d')` | `True`（继承自 Symbol） | ✅ 能 |
+| `f(x)`（AppliedUndef） | `True` | ✅ 能 |
+| `d*m`（Mul 乘积） | `False`（默认值） | ❌ 不能 |
+| `d + m`（Add 加法） | `False`（默认值） | ❌ 不能 |
+| `Derivative(...)` | 条件性 | 取决于表达式 |
+
+#### B.3 为什么用 `d*m` 而不是单个 `d`：深层原因
+
+**核心问题**：当替换发生在含绑定变量的表达式（如 `Derivative`, `Integral`）时，`new._diff_wrt` 的值决定了替换路径。
+
+**Derivative._eval_subs 的关键逻辑**：
+
+```python
+# function.py:1718-1737
+def _eval_subs(self, old, new):
+    # The substitution (old, new) cannot be done inside
+    # Derivative(expr, vars) for a variety of reasons
+    # as handled below.
+    
+    if old in self._wrt_variables:  # old 是微分变量之一
+        # 先处理计数...
+        expr = self.func(self.expr, *[(v, c.subs(old, new))
+            for v, c in self.variable_count])
+        if expr != self:
+            return expr._eval_subs(old, new)
+        
+        # ========== 关键判断 ==========
+        if not getattr(new, '_diff_wrt', False):
+            # case (0): new is not a valid variable of differentiation
+            # new 不是有效的微分变量
+            
+            if isinstance(old, Symbol):
+                # don't introduce a new symbol if the old will do
+                # 返回 Subs 延迟替换对象
+                return Subs(self, old, new)
+            else:
+                xi = Dummy('xi')
+                return Subs(self.xreplace({old: xi}), xi, new)
+```
+
+**两种替换路径的对比**：
 
 ```python
 from sympy import symbols, Derivative, Function
 x, y = symbols('x y')
 f = Function('f')
 
-# x 既是自由变量又是绑定变量
 expr = Derivative(f(x, y), x)
 
-# 目标：只替换自由出现的 x，不替换求导变量
-# 或者：需要区分不同上下文中的 x
+# ========== 情况1：用单个 Dummy 替换（错误路径） ==========
+d = Dummy('d')
+result1 = expr._subs(x, d)
+# d._diff_wrt = True（因为 Dummy 继承自 Symbol）
+# 所以会走"直接重构绑定变量"路径
+# 结果可能是：Derivative(f(d, y), d)
+# 问题：微分变量 x 被直接替换为 d，改变了绑定关系
+
+# ========== 情况2：用乘积 d*m 替换（正确路径） ==========
+m = Dummy('m')
+result2 = expr._subs(x, d*m)
+# (d*m)._diff_wrt = False（因为 Mul 默认 _diff_wrt = False）
+# 所以会走"返回 Subs 延迟替换"路径
+# 结果是：Subs(Derivative(f(x, y), x), x, d*m)
+# 优势：Derivative 的结构被保全，绑定变量关系不变
 ```
 
-**如果只用简单 Dummy 的问题**：
-1. 简单 Dummy 替换无法区分自由变量和绑定变量
-2. `Subs` 表达式（延迟替换）需要正确识别哪些变量需要替换
+#### B.4 含绑定变量表达式的三种返回语义
 
-#### B.2 双层占位实现详解
+**核心设计原则**：
+
+含绑定变量的表达式类（`Derivative`, `Integral`, `Sum`, `Product` 等）在 `_eval_subs` 中根据 `new._diff_wrt` 的值，有三种不同的返回语义：
+
+| 返回语义 | 触发条件 | 行为描述 | 适用场景 |
+|----------|----------|----------|----------|
+| **返回 `Subs` 延迟对象** | `new._diff_wrt = False` | 不直接修改绑定变量，用 `Subs(expr, old, new)` 包裹 | 并行替换、new 不是有效微分变量 |
+| **直接重构绑定变量** | `new._diff_wrt = True` 且类型匹配 | 用 new 替换 old 作为新的绑定变量 | 符号到符号的重命名 |
+| **返回 `None`（后备递归）** | 不涉及绑定变量的替换 | 让 `fallback` 递归处理子表达式 | 替换表达式的自由变量部分 |
+
+**具体代码示例**：
 
 ```python
-# basic.py:1155-1173
-if simultaneous:  # XXX should this be the default for dict subs?
-    reps = {}
-    rv = self
-    kwargs['hack2'] = True
-    
-    # ========== 关键设计：双层占位 ==========
-    m = Dummy('subs_m')  # 标记符 Dummy，最终会被 1 替换
-    
-    for old, new in sequence:
-        com = new.is_commutative
-        if com is None:
-            com = True
-        
-        d = Dummy('subs_d', commutative=com)  # 实际占位 Dummy
-        
-        # ========== 核心技巧 ==========
-        # 使用 d*m 而不是简单的 d
-        # 这样 Subs 表达式可以正确处理绑定变量
-        rv = rv._subs(old, d*m, **kwargs)
-        
-        if not isinstance(rv, Basic):
-            break
-        
-        reps[d] = new  # 记录实际替换
-    
-    # 最后一步：用 1 替换标记符 m
-    reps[m] = S.One
-    return rv.xreplace(reps)
+# 情况1：返回 Subs 延迟对象（并行替换场景）
+# Derivative._eval_subs 中：
+if not getattr(new, '_diff_wrt', False):
+    # new 不是有效微分变量
+    return Subs(self, old, new)
+
+# 情况2：直接重构绑定变量（符号重命名场景）
+# 当 new._diff_wrt = True 时，可能直接替换绑定变量
+# 例如：Derivative(f(x), x)._subs(x, y) 可能直接返回 Derivative(f(y), y)
+
+# 情况3：返回 None（后备递归）
+# 当替换不涉及绑定变量时
+# 例如：Derivative(f(x) + g(y), x)._subs(g(y), 1)
+# 这涉及自由变量 y，返回 None 让 fallback 处理
 ```
 
-#### B.3 为什么 `d*m` 而不是 `d`
+#### B.5 并行替换的完整执行路径
 
-**技术细节**：
+**以 `Derivative(f(x, y), x).subs({x: a, y: b}, simultaneous=True)` 为例**：
 
 ```python
-# 考虑表达式：Derivative(f(x, y), x)
-# 其中：
-# - 第一个 x 是自由变量（f 的参数）
-# - 第二个 x 是绑定变量（求导变量）
+# ========== 步骤1：准备阶段 ==========
+m = Dummy('subs_m')  # 标记符，最终被 1 替换
+kwargs['hack2'] = True
+reps = {}
 
-# 简单 Dummy 替换：
-# expr._subs(x, d) 可能导致：
-# - 所有 x 都被替换，或者
-# - 无法正确构建 Subs 表达式
+# ========== 步骤2：处理第一个替换 x → a ==========
+d1 = Dummy('subs_d', commutative=True)
 
-# 双层占位 d*m：
-# expr._subs(x, d*m) 后：
-# - 自由位置的 x 被替换为 d*m
-# - Subs 表达式可以通过检查 m 的存在来识别哪些是"待替换"的
+# 关键：用 d1*m 替换 x
+# (d1*m)._diff_wrt = False（因为是 Mul）
+expr_after_x = expr._subs(x, d1*m, hack2=True)
+# 结果：Subs(Derivative(f(x, y), x), x, d1*m)
+# Derivative 的结构被保全！
 
-# 最后 xreplace({d: new, m: 1}):
-# - d*m → new*1 → new
-# - 正确的变量被替换
+reps[d1] = a
+
+# ========== 步骤3：处理第二个替换 y → b ==========
+d2 = Dummy('subs_d', commutative=True)
+
+# 用 d2*m 替换 y
+# y 是自由变量（不是绑定变量）
+expr_after_y = expr_after_x._subs(y, d2*m, hack2=True)
+# 结果：Subs(Derivative(f(x, d2*m), x), x, d1*m)
+# y 在 f 的参数中被替换
+
+reps[d2] = b
+
+# ========== 步骤4：最后替换阶段 ==========
+reps[m] = S.One  # 标记符被 1 替换
+
+# 用 xreplace 应用所有替换
+final_result = expr_after_y.xreplace(reps)
+# 执行过程：
+# 1. d2*m → b*1 → b
+# 2. d1*m → a*1 → a
+# 3. Subs 对象可能被求值或保持
+
+# 最终结果类似：Subs(Derivative(f(a, b), x), x, a) 或求值后的形式
 ```
 
-#### B.4 hack2 参数的作用
+#### B.6 hack2 参数的作用
 
 ```python
 # basic.py:1158
@@ -1644,6 +1759,9 @@ def fallback(self, old, new):
         
         # 2-arg hack：处理 Mul 求值为 0 或 1 的特殊情况
         if hack2 and self.is_Mul and not rv.is_Mul:
+            # 原本是 Mul，但重构后不是了（比如 d*m 被简化为 0 或 1）
+            # 这会破坏并行替换的占位机制
+            
             coeff = S.One
             nonnumber = []
             for i in args:
@@ -1652,54 +1770,30 @@ def fallback(self, old, new):
                 else:
                     nonnumber.append(i)
             nonnumber = self.func(*nonnumber)
+            
             if coeff is S.One:
                 return nonnumber
             else:
+                # 关键：用 evaluate=False 保持 Mul 形式
                 return self.func(coeff, nonnumber, evaluate=False)
         return rv
     return self
 ```
 
 **hack2 的目的**：
-- 确保 `d*m` 这样的乘积在替换过程中保持为 `Mul` 对象
-- 即使 `d` 或 `m` 被替换为 0 或 1，也不会过早求值
-- 保证最后一步 `xreplace` 能正确应用所有替换
+- 确保 `d*m` 这样的乘积在替换过程中**保持为 `Mul` 对象**
+- 即使 `d` 或 `m` 被替换为 0 或 1，也用 `evaluate=False` 保持 Mul 形式
+- 保证 `_diff_wrt = False` 的属性不丢失
+- 最后一步 `xreplace` 才能正确应用所有替换
 
-#### B.5 完整执行流程示例
+#### B.7 设计动机总结
 
-```python
-from sympy import symbols, Derivative, Function
-x, y, z = symbols('x y z')
-f = Function('f')
-
-# 原始表达式
-expr = Derivative(f(x, y), x) + z
-
-# 并行替换
-result = expr.subs({x: a, y: b}, simultaneous=True)
-# 期望：Derivative(f(a, b), x) + z 或类似（取决于绑定变量处理）
-
-# 内部执行步骤：
-#
-# 1. 创建标记符 m = Dummy('subs_m')
-#
-# 2. 处理第一个替换 x→a:
-#    - 创建 d1 = Dummy('subs_d')
-#    - 执行 expr._subs(x, d1*m, hack2=True)
-#    - 结果中自由出现的 x 被替换为 d1*m
-#    - 绑定变量 x（求导变量）可能保持不变或特殊处理
-#    - 记录 reps[d1] = a
-#
-# 3. 处理第二个替换 y→b:
-#    - 创建 d2 = Dummy('subs_d')
-#    - 执行 expr._subs(y, d2*m, hack2=True)
-#    - 记录 reps[d2] = b
-#
-# 4. 最后一步：xreplace({d1: a, d2: b, m: 1})
-#    - d1*m → a*1 → a
-#    - d2*m → b*1 → b
-#    - 完成所有替换
-```
+| 问题 | 解决方案 | 关键机制 |
+|------|----------|----------|
+| 单个 Dummy 的 `_diff_wrt = True` | 用乘积 `d*m` 作为占位 | `Mul._diff_wrt = False` |
+| 直接替换会重构绑定变量 | 让 `new._diff_wrt = False` | 触发 `Subs` 延迟替换路径 |
+| 占位符可能被过早求值 | `hack2` + `evaluate=False` | 保持 `Mul` 形式 |
+| 多替换的顺序问题 | 最后一次性 `xreplace` | 并行语义 |
 
 ---
 
